@@ -1,0 +1,6 @@
+# Environment for building the test impact map. Same base image and packages
+# the organizers labeled with, plus coverage. Not used by the scored image.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock coverage==7.10.7
+ENV PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0

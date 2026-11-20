@@ -1,4 +1,6 @@
 IMAGE ?= blast-radius-entry
+# On Windows, python3 is a Store stub: make sample PYTHON="uv run --no-project python"
+PYTHON ?= python3
 SAMPLE := $(CURDIR)/sample
 OUTPUT := $(CURDIR)/output.jsonl
 
@@ -11,7 +13,7 @@ RUN_FLAGS := --rm --platform linux/amd64 --network none --cpus 2 \
 	--volume $(SAMPLE)/commits:/data/commits:ro \
 	--volume $(SAMPLE)/tests.json:/data/tests.json:ro
 
-.PHONY: build sample check
+.PHONY: build sample check map
 
 build:
 	docker build --platform linux/amd64 --tag $(IMAGE) .
@@ -20,10 +22,26 @@ build:
 # scores what it printed.
 sample: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
-	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
+	$(PYTHON) score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT)
 
 # The output's rules only: every line well formed and every commit answered.
 # A wrong selection still passes here; make sample counts the misses.
 check: build
 	docker run $(RUN_FLAGS) $(IMAGE) > $(OUTPUT)
-	python3 score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
+	$(PYTHON) score.py $(SAMPLE) $(SAMPLE)/answers.json $(OUTPUT) > /dev/null && echo "format ok"
+
+# Rebuilds map/impact.json.gz from sqlglot at the pinned commit: runs its whole
+# suite once with tools/map_plugin.py, then folds the results with
+# tools/build_map.py. Needs .cache/sqlglot (the pinned checkout). Takes minutes.
+MAP_IMAGE := blast-radius-map
+map:
+	docker build --platform linux/amd64 -f tools/Dockerfile.map --tag $(MAP_IMAGE) .
+	rm -rf .cache/mapout && mkdir -p .cache/mapout map
+	docker run --rm --platform linux/amd64 -v $(CURDIR)/.cache/sqlglot:/src:ro \
+		-v $(CURDIR)/tools:/tools:ro -v $(CURDIR)/.cache/mapout:/out -w /src \
+		-e PYTHONPATH=/src:/tools -e MAP_OUT=/out $(MAP_IMAGE) \
+		python -m pytest tests -p map_plugin -p no:cacheprovider -q -o addopts= || true
+	docker run --rm --platform linux/amd64 -v $(CURDIR)/.cache/sqlglot:/src:ro \
+		-v $(CURDIR)/tools:/tools:ro -v $(CURDIR)/.cache/mapout:/out \
+		-v $(SAMPLE)/tests.json:/tests.json:ro -v $(CURDIR)/map:/map $(MAP_IMAGE) \
+		python /tools/build_map.py /src /out /tests.json /map/impact.json.gz
