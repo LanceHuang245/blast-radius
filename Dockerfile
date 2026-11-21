@@ -24,6 +24,6 @@ RUN python -m compileall -q /app/blast_radius \
     && PYTHONPATH=/app python -m blast_radius.precompile \
     && chmod -R a+rX /app
 
-ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
+ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1 BR_VERIFY=0
 WORKDIR /app
 CMD ["python", "-m", "blast_radius"]

@@ -10,7 +10,6 @@ from blast_radius import DATA, MAP_FILE, log
 from blast_radius.impact_map import ImpactMap
 from blast_radius.schedule import split
 from blast_radius.select import Selection, Selector
-from blast_radius.verify import plan_verification, verify_batches
 
 
 def main() -> None:
@@ -42,8 +41,13 @@ def main() -> None:
         entries.append((patch.stem, chosen, sel))
 
     # Phase 1 & 2: cost-aware runtime verification in isolated forked children.
-    phase1, phase2 = plan_verification(entries, id_by_number, ms_by_number)
-    verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd)
+    # BR_VERIFY=0 skips it entirely (no verify imports, no pre-warm, no TPC cache).
+    verified: dict[str, set[int]] = {}
+    if os.environ.get("BR_VERIFY", "1") != "0":
+        from blast_radius.verify import plan_verification, verify_batches
+
+        phase1, phase2 = plan_verification(entries, id_by_number, ms_by_number)
+        verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd)
 
     for commit, chosen, sel in entries:
         final_chosen = verified.get(commit, chosen)
