@@ -30,8 +30,8 @@ def main() -> None:
     impact = ImpactMap(MAP_FILE)
     # Uncalibrated tests are single-threaded unit/dialect tests whose measured in-process CPU
     # averages ~0.68x of recorded seconds (heavy multiprocess optimizer tests are calibrated).
-    # BR_CPU_SCALE: realistic container overhead factor (paired with ROI margin & per-module cost).
-    cpu_scale = float(os.environ.get("BR_CPU_SCALE", "1.25"))
+    # BR_CPU_SCALE: per-test CPU factor calibrated for the fast gc.freeze() runtime engine.
+    cpu_scale = float(os.environ.get("BR_CPU_SCALE", "1.0"))
     cpu_by_number = {
         t["number"]: round(impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 750)) * cpu_scale) for t in tests
     }
@@ -49,13 +49,13 @@ def main() -> None:
     for patch in sorted((DATA / "commits").glob("*.patch")):
         sel = selector.select_detailed(patch.read_text(encoding="utf-8", errors="replace"))
         if sel.import_checks:
-            # An edited statement ran during other modules' imports: only pay the ~0.9s child-fork
-            # digest check when narrowing saves >= 1300ms or unlocks high-ROI Phase-2/per-case checks.
+            # An edited statement ran during other modules' imports: with gc.freeze() the child-fork
+            # digest check costs ~0.25s and preserves Phase-2 + per-case edited_spans filtering.
             narrow_cost = _mask_cost_ms(sel.mask)
             coarse_cost = narrow_cost if sel.coarse_mask == sel.mask else _mask_cost_ms(sel.coarse_mask)
-            worth_check = (coarse_cost - narrow_cost >= 1300) or (
-                coarse_cost >= 4500
-                and coarse_cost - narrow_cost >= 700
+            worth_check = (coarse_cost - narrow_cost >= 400) or (
+                coarse_cost >= 2500
+                and coarse_cost > narrow_cost
                 and (sel.hot_patch_targets is not None or sel.edited_spans is not None)
             )
             if worth_check and os.environ.get("BR_VERIFY", "1") != "0":

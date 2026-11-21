@@ -53,21 +53,21 @@ TPC_DISALLOWED_FILES = frozenset({
     "sqlglot/serde.py",
 })
 
-# Measured Docker CPU estimates (ms) used for ROI gating and parent deadline sizing.
-# Full 99-query fast_b/full_cached exceed test_execute_tpcds's 21.45s simulated cost, so they
-# only pass ROI gating when s2b_query_mask/query_mask narrows execution to a subset of queries.
+# Fallback Linux CPU estimates (ms); exact per-query timings are measured on the build host
+# in precompile_cases.py (s2b_query_ms) and used automatically when available.
 TPC_EST_CPU_MS = {
     ("tpcds", "fast_a"): 3000,
-    ("tpcds", "fast_b"): 26000,
-    ("tpcds", "full_cached"): 30000,
+    ("tpcds", "fast_b"): 12800,
+    ("tpcds", "full_cached"): 16500,
     ("tpch", "fast_a"): 450,
-    ("tpch", "fast_b"): 1800,
-    ("tpch", "full_cached"): 2400,
+    ("tpch", "fast_b"): 1500,
+    ("tpch", "full_cached"): 2000,
 }
 
-# fast_a re-executes queries whose optimized plan changed; beyond these it keeps the test instead.
-TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "10"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "3.5"))
+# fast_a re-executes queries whose optimized plan changed; cheapest queries run first so broken
+# commits fail fast while legitimate plan refactors can still pass within budget.
+TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "25"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "6.0"))
 
 _meta_cache: dict | None = None
 _ckpts_meta_cache: dict | None = None
@@ -259,10 +259,27 @@ def est_tpc_mode_ms(
     s2b_matched: int | None,
     total_queries: int,
     edited_spans: tuple[tuple[str, int, int], ...] | None = None,
+    s2b_mask: int | None = None,
+    s1_mask: int | None = None,
 ) -> int:
-    """Estimate TPC CPU (ms) accounting for untouched sub-stages, checkpoints, and per-query filtering."""
+    """Estimate TPC CPU (ms) accounting for untouched sub-stages, checkpoints, and exact per-query timings."""
     if mode == "fast_a":
         return est_tpc_fast_a_ms(suite_name, patched_files, s1_matched, total_queries, edited_spans)
+    meta = load_tpcds_ckpts_meta()
+    q_ms = (meta.get("s2b_query_ms") or {}).get(suite_name) if meta else None
+    if q_ms and len(q_ms) == total_queries:
+        if mode == "fast_b":
+            if s2b_mask is not None:
+                total = sum(q_ms[i] for i in range(total_queries) if s2b_mask >> i & 1)
+                return max(150, total + 120)
+            return max(500, sum(q_ms) + 250)
+        if mode == "full_cached":
+            s1_est = est_tpc_fast_a_ms(suite_name, patched_files, s1_matched, total_queries, edited_spans)
+            if s1_mask is not None and s2b_mask is not None:
+                fm = s1_mask | s2b_mask
+                s2_est = sum(q_ms[i] for i in range(total_queries) if fm >> i & 1)
+                return max(250, s1_est + s2_est + 150)
+            return max(800, s1_est + sum(q_ms) + 250)
     base = TPC_EST_CPU_MS[(suite_name, mode)]
     if mode == "fast_b" and s2b_matched is not None and total_queries > 0:
         return max(150, base * (s2b_matched + 1) // (total_queries + 1))
@@ -612,8 +629,16 @@ def verify_tpc_test(
                 _why(f"{suite_name} q{index}: rows differ")
             return ok
 
+        # Order queries by ascending Stage-2b runtime so broken commits fail fast on cheap queries.
+        meta_for_order = load_tpcds_ckpts_meta()
+        q_cost_ms = (meta_for_order.get("s2b_query_ms") or {}).get(suite_name) if meta_for_order else None
+        q_order = list(range(len(s1["queries"])))
+        if q_cost_ms and len(q_cost_ms) == len(q_order):
+            q_order.sort(key=lambda i: (q_cost_ms[i], i))
+
         if not (skip_opt and skip_duck and skip_plan):
-            for index, q in enumerate(s1["queries"]):
+            for index in q_order:
+                q = s1["queries"][index]
                 if query_mask is not None and not (query_mask >> index & 1):
                     continue
                 if skip_opt:
@@ -722,14 +747,18 @@ def verify_tpc_test(
 
     if mode == "fast_b":
         # Stage 2 only: rebuild Plan from cached optimized AST and run patched PythonExecutor,
-        # loading only the queries & tables matching s2b_query_mask when available.
-        if has_s2_blobs and s2b_query_mask is not None:
+        # loading queries & tables lazily in ascending runtime order so broken commits fail fast.
+        if has_s2_blobs:
             with open(TPC_S2_BLOBS_DIR / suite_name / "meta.pkl", "rb") as handle:
                 s2_meta = pickle.load(handle)
             schema = s2_meta["schema"]
+            q_ms = s2_meta.get("s2b_query_ms")
+            order = list(range(s2_meta["n_queries"]))
+            if q_ms and len(q_ms) == len(order):
+                order.sort(key=lambda i: (q_ms[i], i))
             tables_by_name: dict[str, Table] = {}
-            for idx in range(s2_meta["n_queries"]):
-                if not (s2b_query_mask >> idx & 1):
+            for idx in order:
+                if s2b_query_mask is not None and not (s2b_query_mask >> idx & 1):
                     continue
                 with open(tpc_s2_query_file(suite_name, idx), "rb") as handle:
                     q = pickle.load(handle)
@@ -769,18 +798,23 @@ def verify_tpc_test(
                 return False
         return True
 
-    # Full cached path: Stage 1 + Stage 2 + DuckDB transpile parity (with optional per-query filtering).
+    # Full cached path: Stage 1 + Stage 2 + DuckDB transpile parity (lazy blobs, cheapest queries first).
     s1 = _load_s1()
     full_mask = (query_mask | s2b_query_mask) if (query_mask is not None and s2b_query_mask is not None) else None
-    if has_s2_blobs and full_mask is not None:
+    if has_s2_blobs:
         with open(TPC_S2_BLOBS_DIR / suite_name / "meta.pkl", "rb") as handle:
             s2_meta = pickle.load(handle)
         schema = s2_meta["schema"]
         ensured_schema = ensure_schema(schema)
+        q_ms = s2_meta.get("s2b_query_ms")
+        order = list(range(len(s1["queries"])))
+        if q_ms and len(q_ms) == len(order):
+            order.sort(key=lambda i: (q_ms[i], i))
         tables_by_name = {}
-        for idx, q1 in enumerate(s1["queries"]):
-            if not (full_mask >> idx & 1):
+        for idx in order:
+            if full_mask is not None and not (full_mask >> idx & 1):
                 continue
+            q1 = s1["queries"][idx]
             expr = parse_one(q1["sql"])
             if not q1["execute"]:
                 continue

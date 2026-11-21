@@ -59,11 +59,11 @@ from blast_radius.tpc_verify import (
 # Decision thresholds (overridable via env vars for local A/B benchmarking).
 MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "6000"))
 MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "6000"))
-MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "350"))
-MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "600"))
-MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.45"))
+MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "200"))
+MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "400"))
+MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.12"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
-TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "38000"))
+TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "85000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
@@ -281,9 +281,13 @@ def _install_open_overlay(patched_files: dict[str, str]) -> None:
     io.open = patched_open
 
 
+_IMPORT_DIGESTS: dict[str, str] | None = None
+
+
 def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dict[str, str | None]:
     """Import every sqlglot module with the patch in a forked child and digest `names`
     (see blast_radius.import_state). Empty if the child fails."""
+    gc.freeze()
     r_fd, w_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -317,11 +321,13 @@ def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dic
 
 def check_import_state(patched_files: dict[str, str], owners: list[str]) -> bool:
     """True iff every owner's import-time state digest under the patch equals the pinned one."""
-    from blast_radius.import_state import STATE_FILE
+    global _IMPORT_DIGESTS
+    if _IMPORT_DIGESTS is None:
+        from blast_radius.import_state import STATE_FILE
 
-    expected = marshal.loads(STATE_FILE.read_bytes())["digests"]
+        _IMPORT_DIGESTS = marshal.loads(STATE_FILE.read_bytes())["digests"]
     got = import_state_digests(patched_files, owners)
-    return all(name in expected and got.get(name) == expected[name] for name in owners)
+    return all(name in _IMPORT_DIGESTS and got.get(name) == _IMPORT_DIGESTS[name] for name in owners)
 
 
 def _find_unique_code(parent_code: types.CodeType, steps: list[str]) -> types.CodeType | None:
@@ -696,6 +702,8 @@ def _special_cpu_ms(
             s2b_mask.bit_count() if s2b_mask is not None else None,
             total_q,
             edited_spans=sel.edited_spans,
+            s2b_mask=s2b_mask,
+            s1_mask=q_mask,
         )
     if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
         return 100
@@ -1141,13 +1149,16 @@ def _start_child_verification(
                 _mark(num, _run_candidate(num))
 
         # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
-        # each failure with adaptive throttling on broad breaking commits.
+        # each failure with adaptive throttling and a per-commit CPU cap.
         if not (sel.fixture_only and not VERIFY_FIXTURE_MAX_MS):
             per_mod_ms = 20 if task.phase == 1 else 4
-            for _ in range(4):
-                if len(failed) >= 2 and not passed:
+            step2c_t0 = time.process_time()
+            for _ in range(12):
+                if time.process_time() - step2c_t0 > 8.0:
                     break
-                cur_roi = 2.6 if (len(failed) >= 2 and len(failed) >= len(passed)) else MIN_ROI_RATIO
+                if len(failed) >= 6 and len(failed) >= 2 * max(len(passed), 1):
+                    break
+                cur_roi = 2.0 if (len(failed) >= 3 and len(failed) >= len(passed)) else MIN_ROI_RATIO
                 batch = _best_drop_prefix(
                     task.chosen - passed,
                     verifiable - passed - failed - decap_set,
@@ -1302,11 +1313,16 @@ def plan_verification(
             continue
 
         static_cost_ms, _ = split_with_cost([(ms_by_number[n], n) for n in chosen])
+        # test_lazy_load only checks `import sqlglot`: safe in Phase 2 when zero import-time code changed.
+        lazy_safe_p2 = not sel.import_checks and "tests/dialects/test_dialect.py" not in sel.patched_files
         can_phase2 = (
             ENABLE_HOTPATCH
             and sel.hot_patch_targets is not None
             and not sel.lazy_pp_mask
-            and not any(tid in FRESH_IMPORT_TESTS for tid in tids)
+            and not any(
+                tid in FRESH_IMPORT_TESTS and not (lazy_safe_p2 and tid == LAZY_LOAD_TEST_ID)
+                for tid in tids
+            )
         )
         phase = 2 if can_phase2 else 1
         overhead_ms = 35 if phase == 2 else 320
@@ -1348,7 +1364,7 @@ def plan_verification(
                     raw_decap.append((sim_ms, c_ms, num))
             elif sim_ms >= 150:
                 c_ms = cpu_by_number[num]
-                if c_ms <= sim_ms * 0.72:
+                if c_ms <= sim_ms * 0.85:
                     raw_decap.append((sim_ms, c_ms, num))
 
         # Pick the prefix with the best net makespan / worker-count reduction, trying two
@@ -1375,7 +1391,7 @@ def plan_verification(
                 new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial_pool])
                 net = (static_cost_ms - new_cost) - acc_decap_cpu - (15 if lazy_pp_nums else 0)
                 chosen_decap.append(num)
-                if net >= order_best + 250:
+                if net >= order_best + 100:
                     order_best, order_prefix = net, list(chosen_decap)
             if order_best > best_net:
                 best_net, best_prefix = order_best, order_prefix

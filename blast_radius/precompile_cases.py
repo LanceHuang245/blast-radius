@@ -491,6 +491,16 @@ def _record_extra_subtest_cases(mon, tool: int, src_prefix: str) -> dict[str, di
     targets = (
         ("tests/test_transpile.py", "TestTranspile", "test_identity"),
         ("tests/test_schema.py", "TestSchema", "test_cache_does_not_retain_queries"),
+        ("tests/test_serde.py", "TestSerde", "test_serde"),
+        ("tests/test_optimize_cross_joins.py", "TestOptimizeCrossJoins", "test_conditional_cross_joins"),
+        ("tests/test_expressions.py", "TestExprs", "test_named_selects_long_by_name_chain"),
+        ("tests/dialects/test_dialect.py", "TestDialect", "test_initcap"),
+        ("tests/test_parser.py", "TestParser", "test_is_precedence"),
+        ("tests/test_build.py", "TestBuild", "test_build"),
+        ("tests/test_simplify_between.py", "TestSimplifyBetween", "test_symmetric_truth_values_and_grouping"),
+        ("tests/test_jsonpath.py", "TestJsonpath", "test_cts_file"),
+        ("tests/dialects/test_clickhouse.py", "TestClickhouse", "test_json_extract_qualified_roundtrip"),
+        ("tests/dialects/test_dialect.py", "TestDialect", "test_decimal_literals"),
     )
     prefix_cut = len(src_prefix) - len("sqlglot/")
     state = {"active": False, "mode": None, "depth": 0, "sub_idx": 0, "stride": 1, "cur_bucket": -1}
@@ -631,6 +641,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
     # Convert monolithic tpc_stage1.pkl & tpc_stage2.pkl into lazy per-query / per-table blobs
     # so children load in ~2-5ms instead of unpickling 33MB (~1.2s).
     s1_blobs: dict[str, dict] = {}
+    s2b_query_ms_by_suite: dict[str, list[int]] = {}
     for suite, tid in (
         ("tpcds", "tests/test_executor.py::TestExecutor::test_execute_tpcds"),
         ("tpch", "tests/test_executor.py::TestExecutor::test_execute_tpch"),
@@ -723,6 +734,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
                                 if hasattr(fn, "__code__"):
                                     _collect_codes(fn.__code__)
 
+            s2b_query_ms: list[int] = [0] * len(s2["queries"])
             for idx, q in enumerate(s2["queries"]):
                 with open(tpc_s2_query_file(suite, idx), "wb") as handle:
                     pickle.dump(q, handle, protocol=pickle.HIGHEST_PROTOCOL)
@@ -736,14 +748,28 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
                 mon.restart_events()
                 for co in s2b_codes:
                     mon.set_local_events(tool, co, mon.events.LINE)
+                t_exec = time.process_time()
                 tables_ = ensure_tables(q_tables)
                 PythonExecutor(tables=tables_).execute(plan)
+                s2b_query_ms[idx] = max(1, round((time.process_time() - t_exec) * 1000))
                 for co in s2b_codes:
                     mon.set_local_events(tool, co, 0)
                 recording[0] = False
                 bit = 1 << idx
                 for rel, ln in cur_lines:
                     s2b_lines[rel][ln] = s2b_lines[rel].get(ln, 0) | bit
+            s2b_query_ms_by_suite[suite] = s2b_query_ms
+            with open(suite_dir / "meta.pkl", "wb") as handle:
+                pickle.dump(
+                    {
+                        "schema": s2["schema"],
+                        "n_queries": len(s2["queries"]),
+                        "exec_tables": [q.get("table_names", []) if q["execute"] else [] for q in s2["queries"]],
+                        "s2b_query_ms": s2b_query_ms,
+                    },
+                    handle,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
 
         # Store Stage-1 per-query opt_dump & gen_pairs as lazy bytes blobs.
         q_blobs = []
@@ -916,6 +942,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
         "schema": TPCDS_SCHEMA,
         "checkpoints": ckpt_data,
         "stage_lines": dict(stage_lines),
+        "s2b_query_ms": s2b_query_ms_by_suite,
         "rule_times_ms": [round(x, 1) for x in rule_times_ms],
         "sql_ms": round(sql_ms, 1),
         "gen_files": sorted(gen_files),
@@ -1023,6 +1050,7 @@ def main() -> None:
     meta_payload = {
         "checkpoints": ckpt_meta,
         "stage_lines": ckpts_payload["stage_lines"],
+        "s2b_query_ms": ckpts_payload["s2b_query_ms"],
         "rule_times_ms": ckpts_payload["rule_times_ms"],
         "sql_ms": ckpts_payload["sql_ms"],
         "gen_files": ckpts_payload["gen_files"],
