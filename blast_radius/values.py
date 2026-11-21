@@ -23,7 +23,11 @@ from blast_radius import valuesite as vs
 
 class ValueMap:
     def __init__(self, path: Path, test_ids: list[str]):
-        raw = marshal.loads(gzip.decompress(path.read_bytes()))
+        marshal_path = path.parent / "values.marshal"
+        if marshal_path.is_file():
+            raw = marshal.loads(marshal_path.read_bytes())
+        else:
+            raw = marshal.loads(gzip.decompress(path.read_bytes()))
         pos = {t: i for i, t in enumerate(test_ids)}
         self._remap = [pos.get(t) for t in raw["tests"]]
         self._identity = self._remap == list(range(len(test_ids)))

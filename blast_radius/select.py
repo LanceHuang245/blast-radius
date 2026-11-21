@@ -220,11 +220,11 @@ def _narrow_added_dict_key(cls_key: str, attr: str, toks: tuple[str, ...], impac
     return impact.attr_usage(cls_key, attr) & exp_mask
 
 
-def _tpc_fixture_inputs(text: str) -> tuple[int, list[tuple[str, str]]]:
-    """Extract (segment_count, [(meta, input_sql)]) matching tests/helpers.py load_sql_fixture_pairs."""
+def _fixture_pairs(text: str) -> tuple[int, list[tuple[str, str, str]]]:
+    """Extract (segment_count, [(meta, input_sql, expected_sql)]) matching load_sql_fixture_pairs."""
     filtered = "\n".join(line for line in text.splitlines() if not line.startswith("--"))
     stmts = filtered.split(";")
-    out: list[tuple[str, str]] = []
+    out: list[tuple[str, str, str]] = []
     for i in range(0, len(stmts) - 1, 2):
         raw = stmts[i].strip()
         meta_lines: list[str] = []
@@ -234,8 +234,14 @@ def _tpc_fixture_inputs(text: str) -> tuple[int, list[tuple[str, str]]]:
                 meta_lines.append(ln)
             else:
                 sql_lines.append(ln)
-        out.append(("\n".join(meta_lines), "\n".join(sql_lines).strip()))
+        out.append(("\n".join(meta_lines), "\n".join(sql_lines).strip(), stmts[i + 1].strip()))
     return len(stmts), out
+
+
+def _tpc_fixture_inputs(text: str) -> tuple[int, list[tuple[str, str]]]:
+    """Extract (segment_count, [(meta, input_sql)]) matching tests/helpers.py load_sql_fixture_pairs."""
+    n_seg, pairs = _fixture_pairs(text)
+    return n_seg, [(m, s) for m, s, _ in pairs]
 
 
 def _extract_hot_patch_targets(
@@ -449,16 +455,28 @@ class Selector:
         impact = self.impact
         if not (fp.new and fp.new == fp.old and not fp.binary and fp.new.startswith("sqlglot/") and fp.new.endswith(".py")):
             self._spans_ok = False  # only in-place sqlglot .py edits resolve to statement spans
-        if fp.binary or (fp.old is not None and fp.new is not None and fp.old != fp.new) or fp.new is None:
-            # Binary, renamed or deleted: the in-memory overlay cannot reproduce these, so this
-            # commit is not verified; select what imports or reads the old path (a module that
-            # is gone fails its importers like one that cannot import) and lists its folder.
+        if fp.binary:
             self._no_verify = True
             mask = 0
             for p in {fp.old, fp.new} - {None}:
                 mask |= self._readers(p)
                 if p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) and p == fp.old:
                     mask |= impact.module_level(p)
+            return mask, False, False, None, None
+        if (fp.old is not None and fp.new is not None and fp.old != fp.new) or fp.new is None:
+            # Deleted or renamed non-binary file: represent deletion as None in patched_files
+            # so Phase-1 virtual overlay raises ModuleNotFoundError/FileNotFoundError.
+            mask = 0
+            if fp.old is not None:
+                patched_files[fp.old] = None  # type: ignore[assignment]
+                mask |= self._readers(fp.old)
+                if fp.old.endswith(".py") and fp.old.startswith(("sqlglot/", "tests/")):
+                    mask |= impact.module_level(fp.old)
+            if fp.new is not None:
+                old_file = SOURCE / fp.old if fp.old else None
+                base_text = old_file.read_text(encoding="utf-8") if (old_file and old_file.is_file()) else ""
+                patched_files[fp.new] = apply(base_text, fp.hunks)
+                mask |= self._readers(fp.new)
             return mask, False, False, None, None
         path = fp.new
         if fp.old is None:
@@ -472,6 +490,11 @@ class Selector:
                 raise Everything(f"no pinned fixture for {path}")
             old_text = file.read_text(encoding="utf-8")
             new_text = apply(old_text, fp.hunks)
+            if path.startswith("tests/fixtures/optimizer/") and path.endswith(".sql"):
+                # load_sql_fixture_pairs strips `--` comment lines and trims around `;`:
+                # pure comment/whitespace fixture edits cannot change any test.
+                if _fixture_pairs(old_text) == _fixture_pairs(new_text):
+                    return 0, True, True, [], []
             patched_files[path] = new_text
             fmask = self.select_fixture(path)
             # TestExecutor.test_execute_tpcds/tpch only read (meta, input_sql) and ignore the

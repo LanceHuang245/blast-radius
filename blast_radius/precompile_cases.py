@@ -30,6 +30,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 
 from blast_radius import APP, SOURCE
+from blast_radius.astlayout import layout as ast_layout
 from blast_radius.precompile_tpc import TPC_STAGE1_FILE, TPC_STAGE2_FILE, plan_signature
 
 CASES_FILE = APP / "map" / "cases.marshal"
@@ -224,17 +225,54 @@ def transform_block_method(mod, cls: type, method_name: str, ok_fn) -> int:
     return len(groups)
 
 
-def _record_block_cases(mon, tool: int, src_prefix: str) -> dict[str, dict]:
+def _record_block_cases(mon, tool: int, src_prefix: str, skip_tids: set[str] | None = None) -> dict[str, dict]:
     """Record per-block line coverage and CPU weights for heavy multi-block unit tests."""
     import sqlglot.generator as generator
 
-    targets = (
+    explicit_targets = [
         ("tests/test_optimizer.py", "TestOptimizer", "test_scope"),
         ("tests/test_optimizer.py", "TestOptimizer", "test_deep_ast_type_annotation"),
         ("tests/test_optimizer.py", "TestOptimizer", "test_values_annotation"),
         ("tests/test_expressions.py", "TestExprs", "test_is_star"),
         ("tests/test_executor.py", "TestExecutor", "test_scalar_functions"),
-    )
+    ]
+    skip_special = frozenset({
+        "tests/test_parser.py::TestParser::test_max_nodes",
+        "tests/test_generator.py::TestGenerator::test_generator_memory",
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+        "tests/test_executor.py::TestExecutor::test_execute_tpch",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+        "tests/test_executor.py::TestExecutor::test_agg_order",
+        "tests/test_serde.py::TestSerde::test_recursion",
+    }) | (skip_tids or set())
+
+    # Auto-discover additional heavy (>=50ms) multi-block tests across top-level test_*.py files.
+    targets: list[tuple[str, str, str, bool]] = [(f, c, m, True) for f, c, m in explicit_targets]
+    seen_targets = {(f, c, m) for f, c, m in explicit_targets}
+    for rel_file in sorted(glob.glob("tests/test_*.py", root_dir=str(SOURCE))):
+        if rel_file in ("tests/test_docs.py", "tests/test_dialect_imports.py", "tests/test_executor.py"):
+            continue
+        try:
+            tree = ast.parse((SOURCE / rel_file).read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for item in node.body:
+                if (
+                    isinstance(item, ast.FunctionDef)
+                    and item.name.startswith("test_")
+                    and len(item.body) >= 4
+                    and (rel_file, node.name, item.name) not in seen_targets
+                ):
+                    tid = f"{rel_file}::{node.name}::{item.name}"
+                    if tid in skip_special:
+                        continue
+                    if len(split_independent_blocks(item.body)) >= 2:
+                        targets.append((rel_file, node.name, item.name, False))
+                        seen_targets.add((rel_file, node.name, item.name))
+
     current_lines: set[tuple[str, int]] = set()
     active = [False]
     prefix_cut = len(src_prefix) - len("sqlglot/")
@@ -254,12 +292,18 @@ def _record_block_cases(mon, tool: int, src_prefix: str) -> dict[str, dict]:
     per_test: dict[str, dict] = {}
     setup_done: set[type] = set()
     try:
-        for rel_file, cls_name, meth in targets:
+        for rel_file, cls_name, meth, is_explicit in targets:
             mod = importlib.import_module(rel_file[:-3].replace("/", "."))
             cls = getattr(mod, cls_name)
             if cls not in setup_done and cls_name != "TestExecutor":
                 cls.setUpClass()
                 setup_done.add(cls)
+            if not is_explicit:
+                t_chk = time.process_time()
+                r_chk = unittest.TestResult()
+                cls(meth).run(r_chk)
+                if not r_chk.wasSuccessful() or (time.process_time() - t_chk) < 0.050:
+                    continue
             n_blocks = transform_block_method(mod, cls, meth, _block_ok)
             if n_blocks < 2 or n_blocks > 64:
                 continue
@@ -1051,6 +1095,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
     ckpt_data[0] = {
         "files": sorted(cum_files),
         "dumps_b": [pickle.dumps(serde_dump(e), protocol=4) for e in exprs],
+        "layouts_b": [pickle.dumps(ast_layout(e), protocol=4) for e in exprs],
     }
 
     # Bits 1..14: RULES[0..13].
@@ -1059,6 +1104,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
             ckpt_data[idx] = {
                 "files": sorted(cum_files),
                 "dumps_b": [pickle.dumps(serde_dump(e), protocol=4) for e in exprs],
+                "layouts_b": [pickle.dumps(ast_layout(e), protocol=4) for e in exprs],
             }
         params = inspect.getfullargspec(rule).args
         if idx < 7:
@@ -1072,6 +1118,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
     ckpt_data[14] = {
         "files": sorted(cum_files),
         "dumps_b": [pickle.dumps(serde_dump(e), protocol=4) for e in exprs],
+        "layouts_b": [pickle.dumps(ast_layout(e), protocol=4) for e in exprs],
     }
 
     # Bit 17: e.sql(pretty=True) for verify_opt_tpcds.
@@ -1186,14 +1233,14 @@ def main() -> None:
             os._exit(0)
         return pid
 
-    pid_opt = _spawn_recorder(
-        opt_tmp,
-        lambda mon, tool: {
+    def _opt_and_blocks(mon, tool):
+        base = {
             **_record_optimizer_cases(mon, tool, src_prefix),
             **_record_extra_subtest_cases(mon, tool, src_prefix),
-            **_record_block_cases(mon, tool, src_prefix),
-        },
-    )
+        }
+        return {**base, **_record_block_cases(mon, tool, src_prefix, skip_tids=set(base))}
+
+    pid_opt = _spawn_recorder(opt_tmp, _opt_and_blocks)
     pid_val = _spawn_recorder(val_tmp, lambda mon, tool: _record_validator_cases(mon, tool, src_prefix))
 
     mon = sys.monitoring
@@ -1229,6 +1276,7 @@ def main() -> None:
         stage_file = tpcds_ckpt_stage_file(k)
         payload = {
             "dumps_b": entry["dumps_b"],
+            "layouts_b": entry["layouts_b"],
             "expected": ckpts_payload["expected"],
             "schema": ckpts_payload["schema"],
         }

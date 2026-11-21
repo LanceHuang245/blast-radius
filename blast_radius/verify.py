@@ -49,6 +49,7 @@ from blast_radius.tpc_verify import (
     select_tpc_mode,
     select_tpcds_ckpt,
     select_tpcds_span,
+    tokenizer_edit_position_free,
     verify_generator_memory,
     verify_lazy_athena_presto,
     verify_max_nodes,
@@ -229,8 +230,8 @@ class _OverlayLoader(importlib.abc.Loader):
 class _OverlayFinder(importlib.abc.MetaPathFinder):
     """Serves patched .py modules directly from memory before filesystem finders."""
 
-    def __init__(self, patched_files: dict[str, str]):
-        self._modules: dict[str, tuple[str, str, bool]] = {}
+    def __init__(self, patched_files: dict[str, str | None]):
+        self._modules: dict[str, tuple[str, str | None, bool]] = {}
         for rel_path, text in patched_files.items():
             if rel_path.endswith(".py"):
                 mod = module_name(rel_path)
@@ -243,6 +244,8 @@ class _OverlayFinder(importlib.abc.MetaPathFinder):
         if entry is None:
             return None
         abs_path, text, is_pkg = entry
+        if text is None:
+            raise ModuleNotFoundError(f"No module named '{fullname}'", name=fullname)
         spec = importlib.machinery.ModuleSpec(
             fullname,
             _OverlayLoader(abs_path, text),
@@ -254,14 +257,14 @@ class _OverlayFinder(importlib.abc.MetaPathFinder):
         return spec
 
 
-def _install_open_overlay(patched_files: dict[str, str]) -> None:
+def _install_open_overlay(patched_files: dict[str, str | None]) -> None:
     """Redirect builtins.open and io.open reads of patched files to in-memory StringIO/BytesIO."""
     if not patched_files:
         return
-    overlay: dict[str, tuple[str, bytes]] = {}
+    overlay: dict[str, tuple[str, bytes] | None] = {}
     for rel_path, text in patched_files.items():
         abs_path = os.path.abspath(str(SOURCE / rel_path))
-        overlay[abs_path] = (text, text.encode("utf-8"))
+        overlay[abs_path] = None if text is None else (text, text.encode("utf-8"))
 
     orig_open = builtins.open
 
@@ -271,8 +274,10 @@ def _install_open_overlay(patched_files: dict[str, str]) -> None:
                 resolved = os.path.abspath(os.fsdecode(file))
             except Exception:
                 resolved = ""
-            hit = overlay.get(resolved)
-            if hit is not None:
+            if resolved in overlay:
+                hit = overlay[resolved]
+                if hit is None:
+                    raise FileNotFoundError(2, "No such file or directory", resolved)
                 text, raw = hit
                 if "b" in mode:
                     return io.BytesIO(raw)
@@ -781,7 +786,9 @@ def _special_cpu_ms(
         return 100
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
         tok_touched = any(p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py") for p in sel.patched_files)
-        return 16500 if tok_touched else 400
+        if tok_touched and not tokenizer_edit_position_free(sel):
+            return 16500
+        return 400
     if tid == GEN_MEM_TEST_ID:
         can_fast, is_scoped = _can_fast_gen_mem(sel)
         if can_fast and is_scoped:
@@ -836,7 +843,9 @@ def _best_drop_prefix(
     removed: set[int] = set()
     seen_mods: set[str] = set()
     best_net, best, prefix, spent, top = min_gain - 1, [], [], 0, 0
-    for num in order[:limit]:
+    # Allow seeing the count==0 worker-startup cliff on clean commits with 201..600 tests.
+    scan_limit = max(limit, len(pool)) if len(pool) <= 600 else limit
+    for num in order[:scan_limit]:
         removed.add(num)
         prefix.append(num)
         total -= ms_by_number[num]
@@ -1100,7 +1109,7 @@ def _start_child_verification(
             if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
                 signal.alarm(60)
                 try:
-                    return verify_max_nodes(sel.patched_files)
+                    return verify_max_nodes(sel.patched_files, position_free=tokenizer_edit_position_free(sel))
                 except BaseException:
                     return False
                 finally:
@@ -1235,12 +1244,14 @@ def _start_child_verification(
             per_mod_ms = 20 if task.phase == 1 else 4
             step2c_t0 = time.process_time()
             step2c_est_ms = 0
+            s2c_failed = 0
+            s2c_passed = 0
             for _ in range(5):
                 if step2c_est_ms > 5000 or time.process_time() - step2c_t0 > 12.0:
                     break
-                if len(failed) >= 2 and not passed:
+                if s2c_failed >= 2 and not s2c_passed:
                     break
-                cur_roi = 2.5 if (len(failed) >= 2 and len(failed) >= len(passed)) else MIN_ROI_RATIO
+                cur_roi = 2.5 if (s2c_failed >= 2 and s2c_failed >= s2c_passed) else MIN_ROI_RATIO
                 batch = _best_drop_prefix(
                     task.chosen - passed,
                     verifiable - passed - failed - decap_set,
@@ -1254,7 +1265,16 @@ def _start_child_verification(
                 if not batch:
                     break
                 step2c_est_ms += sum(cpu_by_number[n] for n in batch)
-                if all(_mark(num, _run_candidate(num)) for num in batch):
+                batch_ok = True
+                for num in batch:
+                    ok_n = _mark(num, _run_candidate(num))
+                    if ok_n:
+                        s2c_passed += 1
+                    else:
+                        s2c_failed += 1
+                        batch_ok = False
+                        break
+                if batch_ok:
                     break
     except BaseException:
         pass
@@ -1638,7 +1658,7 @@ def _prewarm_for_phase2(
 
     # Install lazy numpy/pandas stubs unconditionally in Phase-2 parent unless a task needs real
     # TPC pandas/numpy or patches test_executor.py — saves ~1.5s in any child importing test_executor.
-    if not any(
+    lazy_data_ok = not any(
         "tests/test_executor.py" in t.selection.patched_files
         or any(
             (id_by_number[n] in TPC_SUITE_BY_TEST_ID and not t.tpc_mode)
@@ -1646,7 +1666,8 @@ def _prewarm_for_phase2(
             for n in t.chosen
         )
         for t in phase2_tasks
-    ):
+    )
+    if lazy_data_ok:
         _install_lazy_data_libs()
 
     for mod_name in sorted(needed_mods):
@@ -1658,6 +1679,8 @@ def _prewarm_for_phase2(
                 if mod_name == "tests.test_optimizer":
                     _install_case_filter(mod)
                     _install_lazy_optimizer_setup(mod.TestOptimizer)
+                elif mod_name == "tests.test_executor" and lazy_data_ok:
+                    _install_lazy_executor_setup(mod.TestExecutor)
             except Exception as err:
                 log(f"prewarm skip {mod_name}: {err}")
 

@@ -20,6 +20,71 @@ TPC_STAGE1_FILE = MAP_FILE.parent / "tpc_stage1.pkl"
 TPC_STAGE2_FILE = MAP_FILE.parent / "tpc_stage2.pkl"
 TPC_META_FILE = MAP_FILE.parent / "tpc_meta.pkl"
 
+# Files whose code may run on a Plan (planner, Python codegen, executor and what they call).
+# Every quoted literal in them counts as a meta key the executor might read; keys never named
+# there (e.g. normalize_identifiers' "dot_parts") cannot change what a plan computes.
+EXEC_SCAN_PATHS = (
+    "sqlglot/executor/",
+    "sqlglot/expressions/",
+    "sqlglot/generators/python.py",
+    "sqlglot/generators/__init__.py",
+    "sqlglot/generator.py",
+    "sqlglot/planner.py",
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/dialects/__init__.py",
+    "sqlglot/helper.py",
+    "sqlglot/schema.py",
+    "sqlglot/serde.py",
+    "sqlglot/trie.py",
+    "sqlglot/time.py",
+    "sqlglot/errors.py",
+    "sqlglot/tokens.py",
+    "sqlglot/tokenizer_core.py",
+    "sqlglot/__init__.py",
+    "sqlglot/optimizer/scope.py",
+    "sqlglot/optimizer/eliminate_joins.py",
+)
+
+
+def exec_meta_keys(source: Path) -> frozenset[str]:
+    """Every string literal in EXEC_SCAN_PATHS, plus each dialect's ORIGINAL_NAME_META_KEY
+    (read through a variable by Generator.function_name)."""
+    import re
+
+    lit = re.compile(r"""(?<![A-Za-z0-9_])[rbuRBU]?(["'])([A-Za-z0-9_.\-]+)\1""")
+    keys: set[str] = set()
+    for path in sorted((source / "sqlglot").rglob("*.py")):
+        rel = path.relative_to(source).as_posix()
+        if rel.startswith(EXEC_SCAN_PATHS):
+            keys.update(m.group(2) for m in lit.finditer(path.read_text(encoding="utf-8")))
+        if rel.startswith("sqlglot/dialects/"):
+            for m in re.finditer(r"ORIGINAL_NAME_META_KEY\s*=\s*([\"'])(\w+)\1", path.read_text(encoding="utf-8")):
+                keys.add(m.group(2))
+    return frozenset(keys)
+
+
+def _reduce_meta(payloads: list, keep_keys: frozenset[str]) -> list:
+    out = []
+    for payload in payloads:
+        meta, typ = payload.get("m"), payload.get("t")
+        if meta is not None or typ is not None:
+            payload = dict(payload)
+            if meta is not None:
+                kept = {k: v for k, v in meta.items() if k in keep_keys}
+                if kept:
+                    payload["m"] = kept
+                else:
+                    del payload["m"]
+            if typ is not None:
+                payload["t"] = _reduce_meta(typ, keep_keys)
+        out.append(payload)
+    return out
+
+
+def exec_dump_fn(dump_fn, keep_keys: frozenset[str]):
+    """dump_fn with each node's (and its type's) meta reduced to keys the executor side may read."""
+    return lambda expression: _reduce_meta(dump_fn(expression), keep_keys)
+
 
 def plan_signature(plan, dump_fn) -> tuple:
     """Order-independent canonical signature of a sqlglot Plan DAG."""
@@ -102,6 +167,8 @@ def _record_suite(
     sqls: list,
     stage1_funcs: set[tuple[str, str]],
     stage2b_funcs: set[tuple[str, str]],
+    exec_files: set[str] | None = None,
+    exec_dump=None,
 ) -> tuple[dict, dict]:
     from sqlglot import find_tables, parse_one, transpile
     from sqlglot.executor.python import PythonExecutor
@@ -122,6 +189,8 @@ def _record_suite(
             rel = fn[len(src_prefix) :]
             if rel.startswith("sqlglot/"):
                 pair = (rel, frame.f_code.co_name)
+                if exec_files is not None and phase[0] in ("s2a", "s2b"):
+                    exec_files.add(rel)
                 if phase[0] == "s2b":
                     stage2b_funcs.add(pair)
                 elif phase[0] in ("s1", "s2a"):
@@ -184,6 +253,11 @@ def _record_suite(
             phase[0] = ""
             opt_dump = serde_dump(opt_expr)
             p_sig = plan_signature(plan, serde_dump)
+            p_sig_x = None
+            if exec_dump is not None:
+                sys.setprofile(None)  # pure Python dumping: profiling it would only slow the build
+                p_sig_x = plan_signature(plan, exec_dump)
+                sys.setprofile(profiler)
 
             # Stage 2b covers ensure_tables, PythonExecutor init, and row execution.
             phase[0] = "s2b"
@@ -200,6 +274,7 @@ def _record_suite(
                 "duckdb_sql": duck_sql,
                 "opt_dump": opt_dump,
                 "plan_sig": p_sig,
+                "plan_sig_x": p_sig_x,
             })
             queries_s2.append({
                 "execute": True,
@@ -237,24 +312,41 @@ def main() -> None:
     from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA
     from tests.test_executor import TestExecutor
 
+    from sqlglot.serde import dump as serde_dump
+
+    keep_keys = exec_meta_keys(SOURCE)
+    exec_dump = exec_dump_fn(serde_dump, keep_keys)
+    exec_files: set[str] = set()
     TestExecutor.setUpClass()
     try:
         stage1_funcs: set[tuple[str, str]] = set()
         stage2b_funcs: set[tuple[str, str]] = set()
 
         tpch_s1, tpch_s2 = _record_suite(
-            "tpch", TPCH_SCHEMA, TestExecutor.tpch_tables, TestExecutor.tpch_sqls, stage1_funcs, stage2b_funcs
+            "tpch", TPCH_SCHEMA, TestExecutor.tpch_tables, TestExecutor.tpch_sqls, stage1_funcs, stage2b_funcs,
+            exec_files, exec_dump,
         )
         tpcds_s1, tpcds_s2 = _record_suite(
-            "tpcds", TPCDS_SCHEMA, TestExecutor.tpcds_tables, TestExecutor.tpcds_sqls, stage1_funcs, stage2b_funcs
+            "tpcds", TPCDS_SCHEMA, TestExecutor.tpcds_tables, TestExecutor.tpcds_sqls, stage1_funcs, stage2b_funcs,
+            exec_files, exec_dump,
         )
     finally:
         TestExecutor.tearDownClass()
+
+    # The reduced signatures are only sound if every file that ran on a plan was scanned for keys.
+    unscanned = sorted(f for f in exec_files if not f.startswith(EXEC_SCAN_PATHS))
+    if unscanned:
+        print(f"precompile_tpc: exec files not scanned for meta keys {unscanned}: no reduced plan signatures", file=sys.stderr)
+        for s1 in (tpch_s1, tpcds_s1):
+            for q in s1["queries"]:
+                q.pop("plan_sig_x", None)
 
     # Save small metadata, Stage-1 (~2MB) and Stage-2 (~33MB) caches separately for instant fast_a loads.
     meta = {
         "stage1_funcs": sorted(stage1_funcs),
         "stage2b_funcs": sorted(stage2b_funcs),
+        "exec_files": sorted(exec_files),
+        "exec_meta_keys": None if unscanned else sorted(keep_keys),
     }
     with open(TPC_META_FILE, "wb") as handle:
         pickle.dump(meta, handle, protocol=pickle.HIGHEST_PROTOCOL)

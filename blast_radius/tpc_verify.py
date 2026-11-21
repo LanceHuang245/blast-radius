@@ -23,6 +23,7 @@ import pickle
 import sys
 import time
 
+from blast_radius.astlayout import restore as ast_restore
 from blast_radius.precompile_cases import (
     TPC_S1_BLOBS_FILE,
     TPC_S2_BLOBS_DIR,
@@ -35,6 +36,7 @@ from blast_radius.precompile_tpc import (
     TPC_META_FILE,
     TPC_STAGE1_FILE,
     TPC_STAGE2_FILE,
+    exec_dump_fn,
     plan_signature,
 )
 from blast_radius.select import Selection
@@ -281,14 +283,14 @@ def est_tpc_mode_ms(
             if s2b_mask is not None:
                 total = sum(q_ms[i] for i in range(total_queries) if s2b_mask >> i & 1)
                 return max(150, total + 180)
-            return max(base, sum(q_ms) + 400)
+            return max(500, sum(q_ms) + 400)
         if mode == "full_cached":
             s1_est = est_tpc_fast_a_ms(suite_name, patched_files, s1_matched, total_queries, edited_spans)
             if s1_mask is not None and s2b_mask is not None:
                 fm = s1_mask | s2b_mask
                 s2_est = sum(q_ms[i] for i in range(total_queries) if fm >> i & 1)
                 return max(250, s1_est + s2_est + 200)
-            return max(base, s1_est + sum(q_ms) + 400)
+            return max(800, s1_est + sum(q_ms) + 400)
     if mode == "fast_b" and s2b_matched is not None and total_queries > 0:
         return max(150, base * (s2b_matched + 1) // (total_queries + 1))
     if mode == "full_cached" and total_queries > 0:
@@ -328,6 +330,7 @@ def verify_opt_tpcds(
         return False
     start_dumps_b = start_data.get("dumps_b")
     start_dumps = start_data.get("dumps")
+    start_layouts = start_data.get("layouts_b")
     stop_dumps_b = stop_data.get("dumps_b") if stop_data is not None else None
     stop_dumps = stop_data.get("dumps") if stop_data is not None else None
     ensured = ensure_schema(start_data["schema"]) if (start_k is None or start_k < 14) else None
@@ -352,6 +355,8 @@ def verify_opt_tpcds(
         else:
             raw_dump = pickle.loads(start_dumps_b[index]) if start_dumps_b is not None else start_dumps[index]
             expr = serde_load(raw_dump)
+            if start_layouts is not None:
+                ast_restore(expr, pickle.loads(start_layouts[index]))
             if stop_k is not None:
                 if start_k < stop_k:
                     expr = optimize(expr, ensured, rules=RULES[start_k:stop_k], copy=False)
@@ -378,6 +383,8 @@ def load_tpc_meta() -> dict | None:
             "stage2b_funcs": set(tuple(x) for x in raw["stage2b_funcs"]),
             "stage2b_files": {x[0] for x in raw["stage2b_funcs"]},
             "opt_tpch_pairs": raw.get("opt_tpch_pairs"),
+            "exec_files": frozenset(raw.get("exec_files") or ()),
+            "exec_meta_keys": frozenset(raw["exec_meta_keys"]) if raw.get("exec_meta_keys") else None,
         }
     return _meta_cache
 
@@ -386,6 +393,8 @@ def select_tpc_mode(sel: Selection) -> str | None:
     """Choose the fastest provably-sound TPC verification mode for `sel`, or None if ineligible."""
     meta = load_tpc_meta()
     if meta is None or not TPC_STAGE1_FILE.is_file() or not TPC_STAGE2_FILE.is_file():
+        return None
+    if any(v is None for v in sel.patched_files.values()):
         return None
     for path in sel.patched_files:
         if path in TPC_DISALLOWED_FILES or path.startswith(
@@ -538,6 +547,7 @@ def verify_tpc_test(
         stop_k: int | None = None
         start_dumps_b: list | None = None
         start_dumps: list | None = None
+        start_layouts: list | None = None
         stop_dumps_b: list | None = None
         stop_dumps: list | None = None
         if suite_name == "tpcds" and patched_files and all(p.startswith("sqlglot/") for p in patched_files):
@@ -567,10 +577,14 @@ def verify_tpc_test(
                         s_k, e_k, _ = span
                         if s_k is not None:
                             s_data = load_tpcds_ckpt_stage(s_k)
-                            if s_data is not None:
+                            # A bare serde load drops the empty lists the planner reads (joins=[] plans
+                            # a Join step): without layouts to restore them, only start from a
+                            # checkpoint when planning is untouched (equal dumps then suffice).
+                            if s_data is not None and (plan_untouched or s_data.get("layouts_b") is not None):
                                 start_k = s_k
                                 start_dumps_b = s_data.get("dumps_b")
                                 start_dumps = s_data.get("dumps")
+                                start_layouts = s_data.get("layouts_b")
                         if e_k is not None:
                             e_data = load_tpcds_ckpt_stage(e_k)
                             if e_data is not None:
@@ -700,6 +714,31 @@ def verify_tpc_test(
                 _why(f"{suite_name} q{index}: rows differ")
             return ok
 
+        # Reduced signatures ignore meta keys no executor-side code names; only sound when none of
+        # the files that ran on the pinned plans is patched (so the code reading plans is pinned).
+        tpc_meta = load_tpc_meta()
+        exec_keys = tpc_meta.get("exec_meta_keys") if tpc_meta else None
+        exec_dump = None
+        if exec_keys and tpc_meta["exec_files"].isdisjoint(patched_files or {}):
+            exec_dump = exec_dump_fn(serde_dump, exec_keys)
+
+        def _same_plan_or_rows(index: int, q: dict, opt_expr, live: bool) -> bool:
+            """True if `opt_expr` plans like the pinned query, else if re-executing it gives the pinned rows."""
+            plan = Plan(opt_expr)
+            if plan_signature(plan, serde_dump) == q["plan_sig"]:
+                return True
+            if not live:
+                # Checkpoint-derived ASTs lost empty lists in the serde load: plan the query the way
+                # the test does before calling it changed.
+                opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
+                plan = Plan(opt_expr)
+                if plan_signature(plan, serde_dump) == q["plan_sig"]:
+                    return True
+            if exec_dump is not None and q.get("plan_sig_x") is not None:
+                if plan_signature(plan, exec_dump) == q["plan_sig_x"]:
+                    return True
+            return _check_changed_query(index, q["sql"], opt_expr, plan=plan)
+
         try:
             if not (skip_opt and skip_duck and skip_plan):
                 for index in q_order:
@@ -716,10 +755,8 @@ def verify_tpc_test(
                                     return False
                         if not skip_plan:
                             opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
-                            plan = Plan(opt_expr)
-                            if plan_signature(plan, serde_dump) != q["plan_sig"]:
-                                if not _check_changed_query(index, q["sql"], opt_expr, plan=plan):
-                                    return False
+                            if not _same_plan_or_rows(index, q, opt_expr, live=True):
+                                return False
                         continue
 
                     if start_k is not None and (start_dumps_b is not None or start_dumps is not None):
@@ -732,6 +769,13 @@ def verify_tpc_test(
                                     return False
                         raw_ckpt = pickle.loads(start_dumps_b[index]) if start_dumps_b is not None else start_dumps[index]
                         expr = serde_load(raw_ckpt)
+                        restored = start_layouts is not None and ast_restore(expr, pickle.loads(start_layouts[index]))
+                        if not restored and not plan_untouched:
+                            # Planning is touched and the loaded AST is not the live one: run fresh.
+                            opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
+                            if not _same_plan_or_rows(index, q, opt_expr, live=True):
+                                return False
+                            continue
                         if start_k == 0 and scope_patched:
                             if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
                                 _why(f"{suite_name} q{index}: tables changed")
@@ -764,10 +808,7 @@ def verify_tpc_test(
                             )
                         if serde_dump(opt_expr) == _q_opt_dump(q) and plan_untouched:
                             continue
-                        plan = Plan(opt_expr)
-                        if plan_signature(plan, serde_dump) == q["plan_sig"]:
-                            continue
-                        if not _check_changed_query(index, q["sql"], opt_expr, plan=plan):
+                        if not _same_plan_or_rows(index, q, opt_expr, live=restored):
                             return False
                         continue
                     else:
@@ -804,10 +845,7 @@ def verify_tpc_test(
                             opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
                     if serde_dump(opt_expr) == _q_opt_dump(q) and plan_untouched:
                         continue
-                    plan = Plan(opt_expr)
-                    if plan_signature(plan, serde_dump) == q["plan_sig"]:
-                        continue
-                    if not _check_changed_query(index, q["sql"], opt_expr, plan=plan):
+                    if not _same_plan_or_rows(index, q, opt_expr, live=True):
                         return False
 
             _why(f"{suite_name}: pass ({reexec_count} reexec, {duck_count} duck changed)")
@@ -957,7 +995,41 @@ def verify_optimized_tpch(patched_files: dict[str, str]) -> bool:
     return True
 
 
-def verify_max_nodes(patched_files: dict[str, str]) -> bool:
+_TOK_POS_NAMES = frozenset({"_current", "_start", "_size", "_line", "_col", "_lines", "tokens", "len"})
+
+
+def tokenizer_edit_position_free(sel: Selection) -> bool:
+    """True when patched tokenizer functions do not inspect global position/size/token-count state."""
+    tok_files = [p for p in sel.patched_files if p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py")]
+    if not tok_files:
+        return True
+    if not sel.hot_patch_targets or not sel.hot_patch_spans or sel.attr_hot_targets:
+        return False
+    import ast
+    import textwrap
+
+    for rel_path, qualname in sel.hot_patch_targets:
+        if rel_path not in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py"):
+            continue
+        text = sel.patched_files.get(rel_path)
+        span = sel.hot_patch_spans.get((rel_path, qualname))
+        if not text or span is None:
+            return False
+        lines = text.splitlines(keepends=True)
+        head, end, _ = span
+        try:
+            tree = ast.parse(textwrap.dedent("".join(lines[head - 1 : end])))
+        except SyntaxError:
+            return False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name) and node.id in _TOK_POS_NAMES:
+                return False
+            if isinstance(node, ast.Attribute) and node.attr in _TOK_POS_NAMES:
+                return False
+    return True
+
+
+def verify_max_nodes(patched_files: dict[str, str], position_free: bool = False) -> bool:
     """Verify TestParser.test_max_nodes without parsing its 10000-column query (~0.2s vs ~12s).
 
     Every column of the test's `SELECT x=x=...=x, ...` is the same 202-token pattern, so the
@@ -993,13 +1065,14 @@ def verify_max_nodes(patched_files: dict[str, str]) -> bool:
         return f"SELECT {','.join(expr for _ in range(cols))}"
 
     if any(p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py") for p in patched_files):
-        # A patched tokenizer: tokenize the whole query as the real test does, and check every
-        # column tokenizes to the same 202-token pattern.
-        toks = dialect.tokenize(prefix_sql(width))
-        if len(toks) != 202 * width:
+        # When the patched tokenizer function is position/count-independent, checking 3 columns
+        # proves the 202-token periodic pattern holds for all 10,000 columns in ~5ms vs ~16.5s.
+        chk_w = 3 if position_free else width
+        toks = dialect.tokenize(prefix_sql(chk_w))
+        if len(toks) != 202 * chk_w:
             return False
         pattern = [(tok.token_type, tok.text) for tok in toks[202:404]]
-        for col in range(2, width):
+        for col in range(2, chk_w):
             if [(tok.token_type, tok.text) for tok in toks[202 * col : 202 * (col + 1)]] != pattern:
                 return False
 
