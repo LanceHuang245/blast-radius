@@ -44,6 +44,25 @@ _dict_meta: list[tuple[type, str]] = []
 _attr_reads: dict[str, set[tuple[type, str]]] = {}
 _tracked_attrs: list[str] = []
 
+# Reads that happen while sqlglot imports (no test context), with the source line that read.
+_import_phase = False
+_import_dict_reads: set[tuple[int, str, str, int]] = set()
+_import_attr_reads: set[tuple[type, str, str, int]] = set()
+_pre_hook_classes: set[type] = set()
+_PLUGIN_FILE = os.path.abspath(__file__)
+
+
+def _reader_location() -> tuple[str, int]:
+    """First frame outside this plugin: the sqlglot line that performed the read."""
+    frame = sys._getframe(2)
+    while frame is not None and os.path.abspath(frame.f_code.co_filename) == _PLUGIN_FILE:
+        frame = frame.f_back
+    if frame is None:
+        return "?", 0
+    path = os.path.abspath(frame.f_code.co_filename)
+    rel = os.path.relpath(path, ROOT).replace(os.sep, "/") if path.startswith(ROOT) else "?"
+    return rel, frame.f_lineno
+
 
 def _set_ctx(ctx: str) -> None:
     global _ctx
@@ -163,6 +182,13 @@ class _TrackedDict(dict):
     def _hit(self, key_token: str) -> None:
         if _ctx:
             _dict_reads.setdefault(_ctx, set()).add((self._did, key_token))
+        elif _import_phase:
+            _import_dict_reads.add((self._did, key_token, *_reader_location()))
+
+    def __iter__(self):
+        # Overriding __iter__ makes CPython take the slow path for {**d}, dict(d),
+        # x.update(d) and f(**d): keys() then __getitem__, so those value reads are recorded.
+        return super().__iter__()
 
     def __getitem__(self, key):
         self._hit(_key_str(key))
@@ -223,10 +249,13 @@ class _TrackedAttr:
         self._name = name
 
     def __get__(self, obj, objtype=None):
-        if _ctx:
+        if _ctx or _import_phase:
             actual = type(obj) if obj is not None else objtype
             if actual is not None:
-                _attr_reads.setdefault(_ctx, set()).add((actual, self._name))
+                if _ctx:
+                    _attr_reads.setdefault(_ctx, set()).add((actual, self._name))
+                else:
+                    _import_attr_reads.add((actual, self._name, *_reader_location()))
         return self._val
 
 
@@ -244,26 +273,51 @@ def _all_subclasses(root: type) -> list[type]:
     return seen
 
 
+_SCALAR_TYPES = (int, float, bool, str, bytes, type(None), tuple, frozenset, set, list, Enum)
+
+
+def _instrument_one(cls: type) -> None:
+    """Wrap one class's own plain dicts and simple data attributes (idempotent)."""
+    if not cls.__module__.startswith("sqlglot"):
+        return
+    ckey = _class_key(cls)
+    for name, val in list(cls.__dict__.items()):
+        if name.startswith("_") or name in ("classes",):
+            continue
+        if type(val) is dict and not name.endswith("_TRIE"):
+            did = len(_dict_meta)
+            _dict_meta.append((cls, name))
+            setattr(cls, name, _TrackedDict(val, did))
+        elif isinstance(val, _SCALAR_TYPES) and not callable(val):
+            _tracked_attrs.append(f"{ckey}|{name}")
+            setattr(cls, name, _TrackedAttr(val, name))
+
+
 def _instrument_class_attrs(roots: tuple[type, ...]) -> None:
     """Wrap class dicts and simple data attributes across sqlglot's class hierarchies."""
-    scalar_types = (int, float, bool, str, bytes, type(None), tuple, frozenset, set, list, Enum)
-    seen: set[type] = set()
     for root in roots:
         for cls in _all_subclasses(root):
-            if cls in seen or not cls.__module__.startswith("sqlglot"):
-                continue
-            seen.add(cls)
-            ckey = _class_key(cls)
-            for name, val in list(cls.__dict__.items()):
-                if name.startswith("_") or name in ("classes",):
-                    continue
-                if type(val) is dict and not name.endswith("_TRIE"):
-                    did = len(_dict_meta)
-                    _dict_meta.append((cls, name))
-                    setattr(cls, name, _TrackedDict(val, did))
-                elif isinstance(val, scalar_types) and not callable(val):
-                    _tracked_attrs.append(f"{ckey}|{name}")
-                    setattr(cls, name, _TrackedAttr(val, name))
+            _instrument_one(cls)
+
+
+def _install_creation_hooks(roots: tuple[type, ...]) -> None:
+    """Instrument every later subclass the moment it is created.
+
+    type.__new__ calls __init_subclass__ before the rest of a metaclass __new__
+    runs, so reads made while the class is being finished (and by any import-time
+    code after it) go through the tracked dicts/descriptors and are recorded per class.
+    """
+    for root in roots:
+        original = root.__dict__.get("__init_subclass__")
+
+        def hook(cls, __root=root, __original=original, **kwargs):
+            _instrument_one(cls)
+            if __original is not None:
+                __original.__func__(cls, **kwargs)
+            else:
+                super(__root, cls).__init_subclass__(**kwargs)
+
+        root.__init_subclass__ = classmethod(hook)
 
 
 def _instrument_sqlglot() -> None:
@@ -317,7 +371,22 @@ def pytest_configure(config):
         config_file=False,
     )
     _cov.start()
-    _import_everything()
+
+    # Instrument the base classes, then every subclass as it is created, so reads made
+    # while the rest of sqlglot imports are recorded per class (not just by name).
+    global _import_phase
+    from sqlglot import generator, parser, tokens
+    from sqlglot.dialects import dialect
+
+    roots = (dialect.Dialect, tokens.Tokenizer, parser.Parser, generator.Generator)
+    _instrument_class_attrs(roots)
+    _pre_hook_classes.update(c for root in roots for c in _all_subclasses(root))
+    _install_creation_hooks(roots)
+    _import_phase = True
+    try:
+        _import_everything()
+    finally:
+        _import_phase = False
     _instrument_sqlglot()
 
 
@@ -413,6 +482,18 @@ def pytest_unconfigure(config):
 
     tracked_dicts = sorted({f"{_class_key(cls)}|{attr}" for cls, attr in _dict_meta})
 
+    # Import-time reads, expanded up the MRO like runtime reads, keeping the reading line.
+    import_reads: set[tuple[str, str, str, str, int]] = set()
+    for did, key_tok, file, lineno in _import_dict_reads:
+        cls, attr = _dict_meta[did]
+        for base in cls.__mro__:
+            if base.__module__.startswith("sqlglot") and attr in base.__dict__:
+                import_reads.add((_class_key(base), attr, key_tok, file, lineno))
+    for cls, attr, file, lineno in _import_attr_reads:
+        for base in cls.__mro__:
+            if base.__module__.startswith("sqlglot") and attr in base.__dict__:
+                import_reads.add((_class_key(base), attr, "-", file, lineno))
+
     with open(os.path.join(OUT, "usage.json"), "w") as handle:
         json.dump(
             {
@@ -422,6 +503,8 @@ def pytest_unconfigure(config):
                 "tracked_dicts": tracked_dicts,
                 "attr_reads": attr_usage,
                 "tracked_attrs": sorted(set(_tracked_attrs)),
+                "import_reads": [list(r) for r in sorted(import_reads)],
+                "pre_hook_classes": sorted({_class_key(c) for c in _pre_hook_classes}),
                 "outcomes": _outcomes,
             },
             handle,

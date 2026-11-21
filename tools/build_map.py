@@ -47,11 +47,13 @@ def main() -> None:
 
     lines: dict[str, dict[int, int]] = {}
     import_lines: dict[str, list[int]] = {}
+    collect_lines: dict[str, list[int]] = {}
     covered_tests = 0
     for measured in data.measured_files():
         rel = os.path.relpath(measured, src).replace(os.sep, "/")
         per_line: dict[int, int] = {}
         at_import: list[int] = []
+        at_collect: list[int] = []
         for lineno, contexts in (data.contexts_by_lineno(measured) or {}).items():
             mask = 0
             for context in contexts:
@@ -59,11 +61,15 @@ def main() -> None:
                     at_import.append(lineno)
                 else:
                     mask |= tests_for(context)
+                    if context.startswith("collect|") and (not at_collect or at_collect[-1] != lineno):
+                        at_collect.append(lineno)
             if mask:
                 per_line[lineno] = mask
                 covered_tests |= mask
         lines[rel] = per_line
         import_lines[rel] = sorted(at_import)
+        if at_collect:
+            collect_lines[rel] = sorted(set(at_collect))
 
     usage = json.load(open(os.path.join(run_dir, "usage.json")))
 
@@ -86,15 +92,21 @@ def main() -> None:
             dict_keys[entry] |= mask
 
     attrs: dict[str, int] = defaultdict(int)
+    collect_attrs: set[str] = set()
     for context, entries in usage.get("attr_reads", {}).items():
         mask = tests_for(context)
         for entry in entries:
             attrs[entry] |= mask
+            if context.startswith("collect|"):
+                collect_attrs.add(entry)
 
     trees = parse_all_python(src)
     importers, lazy_importers = import_graphs(trees)
     class_refs = static_class_refs(trees, lines)
     import_any_attrs, import_value_attrs = analyze_import_attr_reads(trees, import_lines)
+    import_reads = class_import_reads(trees, usage.get("import_reads", []))
+    for key, token in class_body_self_reads(trees).items():
+        import_reads[key] = sorted(set(import_reads.get(key, [])) | {token})
 
     # Interning: each distinct test set is stored once, as a hex bitset.
     sets: list[str] = []
@@ -110,6 +122,10 @@ def main() -> None:
         "tests": test_ids,
         "lines": {f: {str(n): intern(m) for n, m in sorted(per.items())} for f, per in sorted(lines.items())},
         "import_lines": import_lines,
+        # Lines and class attributes used while a test module imports. A verifier that
+        # imports test modules once and then patches would see stale results for these.
+        "collect_lines": collect_lines,
+        "collect_attrs": sorted(collect_attrs),
         "paths": {p: intern(m) for p, m in sorted(paths.items()) if m},
         "classes": {c: intern(m) for c, m in sorted(classes.items()) if m},
         "class_refs": {c: intern(m) for c, m in sorted(class_refs.items()) if m},
@@ -119,6 +135,10 @@ def main() -> None:
         "attrs": {k: intern(m) for k, m in sorted(attrs.items()) if m},
         "import_any_attrs": sorted(import_any_attrs),
         "import_value_attrs": sorted(import_value_attrs),
+        # Per-class import-time reads observed at run time; the name-based sets above
+        # only apply to pre_hook_classes, which existed before recording started.
+        "import_reads": import_reads,
+        "pre_hook_classes": usage.get("pre_hook_classes", []),
         "importers": importers,
         "lazy_importers": lazy_importers,
         "uncovered": [t for t, i in index.items() if not covered_tests >> i & 1],
@@ -278,6 +298,93 @@ def static_class_refs(trees: dict[str, ast.Module], lines: dict[str, dict[int, i
                         refs[ckey] |= mask
             stack.extend(ast.iter_child_nodes(cur))
     return refs
+
+
+def class_import_reads(trees: dict[str, ast.Module], records: list[list]) -> dict[str, list[str]]:
+    """`cls|attr` -> key tokens read at import ("-" for a plain attribute read).
+
+    Reads made by `ATTR = {**Base.ATTR, ...}` in a subclass body are skipped: the
+    subclass's copy is tracked on its own and its reads already propagate to Base.
+    """
+    statements: dict[str, dict[int, ast.stmt]] = {}
+    parent_maps: dict[str, dict[int, ast.AST]] = {}
+    copy_only: dict[tuple[str, int, str], bool] = {}
+    out: dict[str, set[str]] = defaultdict(set)
+    for cls_key, attr, token, file, lineno in records:
+        probe = (file, lineno, attr)
+        if probe not in copy_only:
+            copy_only[probe] = _only_mro_copies(trees.get(file), file, lineno, attr, statements, parent_maps)
+        if not copy_only[probe]:
+            out[f"{cls_key}|{attr}"].add(token)
+    return {k: sorted(v) for k, v in sorted(out.items())}
+
+
+def class_body_self_reads(trees: dict[str, ast.Module]) -> dict[str, str]:
+    """`cls|attr` -> "*" for attributes a class body reads by bare name (`Y = f(X)`),
+    or "k" when every such read only looks at keys (`for k in X`, `k in X`, len(X)).
+
+    That code runs before the class object exists, so the plugin cannot observe it.
+    Function and lambda bodies are skipped: they cannot see class scope.
+    """
+    found: dict[str, str] = {}
+    parents: dict[int, ast.AST] = {}
+
+    def visit_class(node: ast.ClassDef, module: str, qualname: str) -> None:
+        stack: list[ast.AST] = list(node.body)
+        while stack:
+            cur = stack.pop()
+            if isinstance(cur, ast.ClassDef):
+                visit_class(cur, module, f"{qualname}.{cur.name}")
+                continue
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend(cur.decorator_list + cur.args.defaults + [d for d in cur.args.kw_defaults if d])
+                continue
+            if isinstance(cur, ast.Lambda):
+                stack.extend(cur.args.defaults + [d for d in cur.args.kw_defaults if d])
+                continue
+            if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Load):
+                key = f"{module}:{qualname}|{cur.id}"
+                parent = parents.get(id(cur))
+                grandparent = parents.get(id(parent)) if parent is not None else None
+                token = "k" if _is_key_only_use(cur, parent, grandparent) else "*"
+                if found.get(key) != "*":
+                    found[key] = token
+            stack.extend(ast.iter_child_nodes(cur))
+
+    for rel, tree in trees.items():
+        if not rel.startswith("sqlglot/"):
+            continue
+        module = module_name(rel)
+        parents.update({id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)})
+        stack: list[tuple[ast.AST, str]] = [(n, "") for n in tree.body]
+        while stack:
+            cur, prefix = stack.pop()
+            if isinstance(cur, ast.ClassDef):
+                visit_class(cur, module, prefix + cur.name)
+            elif isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.extend((n, f"{prefix}{cur.name}.<locals>.") for n in cur.body)
+            else:
+                stack.extend((n, prefix) for n in ast.iter_child_nodes(cur) if isinstance(n, ast.stmt))
+    return found
+
+
+def _only_mro_copies(tree, file, lineno, attr, statements, parent_maps) -> bool:
+    if tree is None or not lineno:
+        return False
+    if file not in statements:
+        # line -> innermost statement covering it (later-starting / shorter statements win)
+        innermost: dict[int, ast.stmt] = {}
+        nodes = sorted((n for n in ast.walk(tree) if isinstance(n, ast.stmt)), key=lambda n: (n.lineno, -n.end_lineno))
+        for node in nodes:
+            for line in range(node.lineno, node.end_lineno + 1):
+                innermost[line] = node
+        statements[file] = innermost
+        parent_maps[file] = {id(c): p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+    best = statements[file].get(lineno)
+    if best is None:
+        return False
+    refs = [n for n in ast.walk(best) if isinstance(n, ast.Attribute) and n.attr == attr and isinstance(n.ctx, ast.Load)]
+    return bool(refs) and all(_is_mro_dict_copy(n, attr, parent_maps[file]) for n in refs)
 
 
 def _is_key_only_use(node: ast.AST, parent: ast.AST | None, grandparent: ast.AST | None) -> bool:

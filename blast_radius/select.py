@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+from dataclasses import dataclass
 
 from blast_radius import SOURCE, Everything
 from blast_radius.impact_map import ImpactMap, module_name
@@ -17,6 +18,133 @@ from blast_radius.scopes import (
     indent,
     same_code,
 )
+
+SAFE_HOTPATCH_DECORATORS = frozenset({"staticmethod", "classmethod", "property"})
+
+
+@dataclass
+class Selection:
+    """Static selection result plus in-memory patched files and hot-patch eligibility."""
+
+    mask: int
+    reason: str
+    patched_files: dict[str, str]
+    # None -> requires Phase 1 clean import; list -> Phase 2 function __code__ hot-patch targets.
+    hot_patch_targets: list[tuple[str, str]] | None
+    # Phase 2 safe non-import-time literal class-attribute updates: (rel_path, cls_qual, attr, val).
+    attr_hot_targets: list[tuple[str, str, str, object]] | None = None
+    fixture_only: bool = False
+
+
+def _decorator_name(node: ast.expr) -> str | None:
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _extract_attr_hot_targets(
+    path: str,
+    module: str,
+    old_scopes: Scopes,
+    new_scopes: Scopes,
+    hunks,
+    impact: ImpactMap,
+) -> list[tuple[str, str, str, object]] | None:
+    """Return [(path, cls_qual, attr, literal_val)] if every edit only updates non-import-time literal class attrs."""
+    targets: list[tuple[str, str, str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for removed, added in change_blocks(hunks):
+        if not removed and not added:
+            continue
+        target_cls = target_attr = None
+        for old_no, _ in removed:
+            info = old_scopes.class_assign_at(old_no)
+            if info is None:
+                return None
+            if target_cls is None:
+                target_cls, target_attr = info[0], info[1]
+            elif (info[0], info[1]) != (target_cls, target_attr):
+                return None
+        for new_no, _anchor, _ in added:
+            info = new_scopes.class_assign_at(new_no)
+            if info is None:
+                return None
+            if target_cls is None:
+                target_cls, target_attr = info[0], info[1]
+            elif (info[0], info[1]) != (target_cls, target_attr):
+                return None
+        if target_cls is None or target_attr is None:
+            return None
+        if impact.read_at_import(f"{module}:{target_cls}", target_attr):
+            return None
+        # A test module read it while importing: the pre-warmed copy would be stale.
+        if f"{module}:{target_cls}|{target_attr}" in impact.collect_attrs:
+            return None
+        if f"{module}:{target_cls}|{target_attr}" not in impact.tracked_attrs:
+            return None
+        new_stmt = new_scopes.class_assigns.get((target_cls, target_attr))
+        if new_stmt is None or new_stmt.value is None:
+            return None
+        try:
+            lit_val = ast.literal_eval(new_stmt.value)
+        except Exception:
+            return None
+        if (target_cls, target_attr) not in seen:
+            seen.add((target_cls, target_attr))
+            targets.append((path, target_cls, target_attr, lit_val))
+    return targets if targets else None
+
+
+def _extract_hot_patch_targets(
+    path: str,
+    old_scopes: Scopes,
+    new_scopes: Scopes,
+    hunks,
+    runs_at_import,
+) -> list[tuple[str, str]] | None:
+    """Return [(path, qualname)] if every edit is strictly inside existing non-nested function bodies."""
+    targets: set[tuple[str, str]] = set()
+    for removed, added in change_blocks(hunks):
+        for old_no, _ in removed:
+            fn = old_scopes.function_at(old_no)
+            if fn is None or old_no < fn[0]:
+                return None
+            body_start, end, _head, qual, old_node = fn
+            if "<locals>" in qual or runs_at_import(path, body_start, end):
+                return None
+            if len(old_scopes.by_qualname.get(qual, ())) != 1 or len(new_scopes.by_qualname.get(qual, ())) != 1:
+                return None
+            new_fn = next((f for f in new_scopes.functions if f[3] == qual), None)
+            if new_fn is None:
+                return None
+            new_node = new_fn[4]
+            if not all(_decorator_name(d) in SAFE_HOTPATCH_DECORATORS for d in old_node.decorator_list):
+                return None
+            if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
+                return None
+            if ast.dump(old_node.args) != ast.dump(new_node.args):
+                return None
+            targets.add((path, qual))
+
+        for new_no, _anchor, _ in added:
+            fn = new_scopes.function_at(new_no)
+            if fn is None or new_no < fn[0]:
+                return None
+            _body_start, _end, _head, qual, new_node = fn
+            if "<locals>" in qual:
+                return None
+            if len(old_scopes.by_qualname.get(qual, ())) != 1 or len(new_scopes.by_qualname.get(qual, ())) != 1:
+                return None
+            old_fn = next((f for f in old_scopes.functions if f[3] == qual), None)
+            if old_fn is None or runs_at_import(path, old_fn[0], old_fn[1]):
+                return None
+            old_node = old_fn[4]
+            if not all(_decorator_name(d) in SAFE_HOTPATCH_DECORATORS for d in old_node.decorator_list):
+                return None
+            if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
+                return None
+            if ast.dump(old_node.args) != ast.dump(new_node.args):
+                return None
+            targets.add((path, qual))
+    return sorted(targets)
 
 
 class Selector:
@@ -36,6 +164,10 @@ class Selector:
         return self._old[path]
 
     def select(self, patch_text: str) -> tuple[int, str]:
+        sel = self.select_detailed(patch_text)
+        return sel.mask, sel.reason
+
+    def select_detailed(self, patch_text: str) -> Selection:
         impact = self.impact
         try:
             files = parse_patch(patch_text)
@@ -43,23 +175,68 @@ class Selector:
                 raise Everything("empty patch")
             mask = 0
             all_noop = True
+            all_fixture_or_noop = True
+            patched_files: dict[str, str] = {}
+            hot_targets: list[tuple[str, str]] | None = []
+            attr_targets: list[tuple[str, str, str, object]] | None = []
             for file_patch in files:
-                file_mask, is_noop = self.select_file(file_patch)
+                file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets = self.select_file_detailed(
+                    file_patch, patched_files
+                )
                 mask |= file_mask
                 all_noop = all_noop and is_noop
-            return mask, "noop" if all_noop and mask == 0 else "mapped"
+                all_fixture_or_noop = all_fixture_or_noop and is_fixture_or_comment
+                if f_targets is None and a_targets is None:
+                    hot_targets = None
+                    attr_targets = None
+                else:
+                    if hot_targets is not None and f_targets:
+                        hot_targets.extend(f_targets)
+                    if attr_targets is not None and a_targets:
+                        attr_targets.extend(a_targets)
+            reason = "noop" if all_noop and mask == 0 else "mapped"
+            return Selection(
+                mask=mask,
+                reason=reason,
+                patched_files=patched_files,
+                hot_patch_targets=hot_targets,
+                attr_hot_targets=attr_targets,
+                fixture_only=all_fixture_or_noop and not all_noop,
+            )
         except Everything as reason:
-            return impact.everything, f"everything ({reason})"
+            return Selection(impact.everything, f"everything ({reason})", {}, None, None, False)
         except Exception as error:  # never let an unexpected input crash the run
-            return impact.everything, f"everything (error {type(error).__name__}: {error})"
+            return Selection(
+                impact.everything,
+                f"everything (error {type(error).__name__}: {error})",
+                {},
+                None,
+                None,
+                False,
+            )
 
-    def select_file(self, fp: FilePatch) -> tuple[int, bool]:
+    def select_file_detailed(
+        self,
+        fp: FilePatch,
+        patched_files: dict[str, str],
+    ) -> tuple[
+        int,
+        bool,
+        bool,
+        list[tuple[str, str]] | None,
+        list[tuple[str, str, str, object]] | None,
+    ]:
         impact = self.impact
         if fp.unusual or fp.old is None or fp.new is None or fp.old != fp.new:
             raise Everything("added, deleted, renamed or binary file")
         path = fp.new
         if path.startswith("tests/fixtures/"):
-            return self.select_fixture(path), False
+            file = SOURCE / path
+            if not file.is_file():
+                raise Everything(f"no pinned fixture for {path}")
+            old_text = file.read_text(encoding="utf-8")
+            patched_files[path] = apply(old_text, fp.hunks)
+            return self.select_fixture(path), False, True, [], []
         if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
             if path.startswith("tests/") and (path.endswith("__init__.py") or path.endswith("conftest.py")):
                 raise Everything("test package plumbing")
@@ -67,8 +244,10 @@ class Selector:
                 raise Everything(f"{path} unknown to the map")
             # Always include tests that directly opened this .py file (e.g. test_typing.py).
             readers = impact.file_readers(path)
-            py_mask, py_noop = self.select_python(path, fp.hunks)
-            return readers | py_mask, py_noop and readers == 0
+            py_mask, py_noop, new_text, targets, attr_targets = self.select_python_detailed(path, fp.hunks)
+            if not py_noop or readers:
+                patched_files[path] = new_text
+            return readers | py_mask, py_noop and readers == 0, py_noop, targets, attr_targets
         raise Everything(f"unmapped path {path}")
 
     def select_fixture(self, path: str) -> int:
@@ -85,13 +264,23 @@ class Selector:
             raise Everything(f"no test reads {path}")
         return mask
 
-    def select_python(self, path: str, hunks) -> tuple[int, bool]:
+    def select_python_detailed(
+        self,
+        path: str,
+        hunks,
+    ) -> tuple[
+        int,
+        bool,
+        str,
+        list[tuple[str, str]] | None,
+        list[tuple[str, str, str, object]] | None,
+    ]:
         old_text, old_scopes = self.old_source(path)
         new_text = apply(old_text, hunks)
 
         changed = [line[1:] for _, _, _, body in hunks for line in body if line[0] in "+-"]
         if comment_lines_only(changed) and same_code(old_text, new_text):
-            return 0, True
+            return 0, True, new_text, [], []
         try:
             new_tree = ast.parse(new_text)
             compile(new_tree, path, "exec", dont_inherit=True)
@@ -103,7 +292,14 @@ class Selector:
         mask = 0
         for removed, added in change_blocks(hunks):
             mask |= self.select_block(path, module, old_scopes, new_scopes, removed, added)
-        return mask, False
+
+        targets: list[tuple[str, str]] | None = None
+        attr_targets: list[tuple[str, str, str, object]] | None = None
+        if path.startswith("sqlglot/"):
+            targets = _extract_hot_patch_targets(path, old_scopes, new_scopes, hunks, self.runs_before_tests)
+            if targets is None:
+                attr_targets = _extract_attr_hot_targets(path, module, old_scopes, new_scopes, hunks, self.impact)
+        return mask, False, new_text, targets, attr_targets
 
     def select_block(self, path, module, old_scopes, new_scopes, removed, added) -> int:
         # Try fine-grained class dict-key or class attribute tracking first.
@@ -203,7 +399,7 @@ class Selector:
         old_val = old_stmt.value
         new_val = new_stmt.value
         if isinstance(old_val, ast.Dict) and isinstance(new_val, ast.Dict):
-            if attr not in impact.import_value_attrs and key_id in impact.tracked_dicts:
+            if key_id in impact.tracked_dicts:
                 old_parsed = _extract_dict_entries(old_val)
                 new_parsed = _extract_dict_entries(new_val)
                 if old_parsed is not None and new_parsed is not None:
@@ -217,6 +413,9 @@ class Selector:
                         ]
                         if not changed_keys:
                             return 0
+                        changed_tokens = [tok for toks in changed_keys for tok in toks]
+                        if impact.read_at_import(cls_key, attr, changed_tokens):
+                            return None
                         mask = impact.dict_key_usage(cls_key, attr, "*")
                         for toks in changed_keys:
                             for tok in toks:
@@ -225,7 +424,7 @@ class Selector:
             return None
 
         # Case 2: Non-dict class data attribute not read at import/metaclass time.
-        if attr not in impact.import_any_attrs and key_id in impact.tracked_attrs:
+        if key_id in impact.tracked_attrs and not impact.read_at_import(cls_key, attr):
             return impact.attr_usage(cls_key, attr)
 
         return None
@@ -268,6 +467,14 @@ class Selector:
 
     def runs_at_import(self, path: str, first: int, last: int) -> bool:
         lines = self.impact.import_lines.get(path)
+        return bool(lines) and any(first <= n <= last for n in lines)
+
+    def runs_before_tests(self, path: str, first: int, last: int) -> bool:
+        """Runs while sqlglot or a test module imports. The verifier imports both once,
+        before patching, so a hot-patched function like this would leave stale results."""
+        if self.runs_at_import(path, first, last):
+            return True
+        lines = self.impact.collect_lines.get(path)
         return bool(lines) and any(first <= n <= last for n in lines)
 
     def function_level(self, path, module, body_start, end) -> int:

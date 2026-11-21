@@ -73,8 +73,13 @@ def _exact_pack(ordered: list[tuple[int, int]], count: int, upper: int, lb: int)
 
 def split(tests: list[tuple[int, int]]) -> list[list[int]]:
     """Optimal worker count and near-exact makespan schedule for (ms, number) tests."""
+    return split_with_cost(tests)[1]
+
+
+def split_with_cost(tests: list[tuple[int, int]]) -> tuple[int, list[list[int]]]:
+    """Return (simulated_cost_ms, workers) for a set of (ms, number) tests."""
     if not tests:
-        return []
+        return 0, []
     ordered = sorted(tests, reverse=True)
     total = sum(ms for ms, _ in ordered)
     heaviest = ordered[0][0]
@@ -94,4 +99,4 @@ def split(tests: list[tuple[int, int]]) -> list[list[int]]:
         if cost < best_cost:
             best_cost = cost
             best_workers = workers
-    return best_workers
+    return best_cost, best_workers

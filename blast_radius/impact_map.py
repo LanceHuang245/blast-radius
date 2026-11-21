@@ -18,6 +18,8 @@ class ImpactMap:
         self._decoded: dict[int, int] = {}
         self.lines: dict[str, dict[str, int]] = raw["lines"]
         self.import_lines = {f: set(v) for f, v in raw["import_lines"].items()}
+        self.collect_lines = {f: set(v) for f, v in raw.get("collect_lines", {}).items()}
+        self.collect_attrs: set[str] = set(raw.get("collect_attrs", []))
         self.paths: dict[str, int] = raw["paths"]
         self.classes: dict[str, int] = raw["classes"]
         self.class_refs: dict[str, int] = raw.get("class_refs", {})
@@ -27,6 +29,8 @@ class ImpactMap:
         self.attrs: dict[str, int] = raw.get("attrs", {})
         self.import_any_attrs: set[str] = set(raw.get("import_any_attrs", []))
         self.import_value_attrs: set[str] = set(raw.get("import_value_attrs", []))
+        self.import_reads: dict[str, set[str]] = {k: set(v) for k, v in raw.get("import_reads", {}).items()}
+        self.pre_hook_classes: set[str] = set(raw.get("pre_hook_classes", []))
         self.importers: dict[str, list[str]] = raw["importers"]
         self.lazy_importers: dict[str, list[list]] = raw.get("lazy_importers", {})
         self.everything = (1 << len(self.test_ids)) - 1
@@ -96,6 +100,22 @@ class ImpactMap:
     def attr_usage(self, cls_key: str, attr: str) -> int:
         index = self.attrs.get(f"{cls_key}|{attr}")
         return 0 if index is None else self.mask(index)
+
+    def read_at_import(self, cls_key: str, attr: str, tokens: list[str] | None = None) -> bool:
+        """Was this class attribute read while sqlglot imported? For a dict, pass the
+        changed key tokens: only those keys (or a read of all values) count.
+
+        Classes created after recording started have exact per-class reads; the base
+        classes that existed before fall back to the name-based sets.
+        """
+        if cls_key in self.pre_hook_classes or not self.import_reads:
+            return attr in (self.import_value_attrs if tokens is not None else self.import_any_attrs)
+        read = self.import_reads.get(f"{cls_key}|{attr}")
+        if not read:
+            return False
+        if tokens is None:
+            return True
+        return "*" in read or "-" in read or any(token in read for token in tokens)
 
     def module_classes(self, module: str) -> int:
         prefix = module + ":"
