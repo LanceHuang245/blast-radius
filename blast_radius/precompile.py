@@ -87,8 +87,8 @@ def _scoped_class_refs(
     trees: dict[str, ast.Module],
     lines_idx: dict[str, dict[str, int]],
     masks: list[int],
-) -> dict[str, int]:
-    """Compute Expression class_refs strictly from runtime `exp.<Cls>.<member>` accesses."""
+) -> tuple[dict[str, int], dict[str, int]]:
+    """Compute Expression class_refs (`exp.<Cls>.<member>`) and all runtime `exp.<Cls>` references."""
     defs_by_name: dict[str, list[tuple[str, str, int, int]]] = defaultdict(list)
     for rel, tree in trees.items():
         if not rel.startswith("sqlglot/expressions/"):
@@ -99,6 +99,7 @@ def _scoped_class_refs(
                 defs_by_name[node.name].append((f"{mod}:{node.name}", rel, node.lineno, node.end_lineno))
 
     refs: dict[str, int] = defaultdict(int)
+    any_refs: dict[str, int] = defaultdict(int)
     for rel, tree in trees.items():
         per_file = lines_idx.get(rel)
         if not per_file:
@@ -118,7 +119,7 @@ def _scoped_class_refs(
                 if isinstance(node, ast.ClassDef) and node.name in defs_by_name:
                     imported_exp[node.name] = node.name
 
-        def record(cls_name: str, ln: int | None) -> None:
+        def record(cls_name: str, ln: int | None, target: dict[str, int], by_name: bool = False) -> None:
             idx = per_file.get(str(ln)) if ln is not None else None
             if idx is None:
                 return
@@ -126,7 +127,7 @@ def _scoped_class_refs(
             for ckey, def_rel, start, end in defs_by_name[cls_name]:
                 if rel == def_rel and start <= ln <= end:
                     continue
-                refs[ckey] |= mask
+                target[cls_name if by_name else ckey] |= mask
 
         def walk(node: ast.AST) -> None:
             if isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -138,9 +139,15 @@ def _scoped_class_refs(
                     and node.value.value.id == "exp"
                     and node.value.attr in defs_by_name
                 ):
-                    record(node.value.attr, getattr(node, "lineno", None))
+                    record(node.value.attr, getattr(node, "lineno", None), refs)
+                    record(node.value.attr, getattr(node, "lineno", None), any_refs, by_name=True)
+                elif isinstance(node.value, ast.Name) and node.value.id == "exp" and node.attr in defs_by_name:
+                    record(node.attr, getattr(node, "lineno", None), any_refs, by_name=True)
                 elif isinstance(node.value, ast.Name) and node.value.id in imported_exp:
-                    record(imported_exp[node.value.id], getattr(node, "lineno", None))
+                    record(imported_exp[node.value.id], getattr(node, "lineno", None), refs)
+                    record(imported_exp[node.value.id], getattr(node, "lineno", None), any_refs, by_name=True)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in imported_exp:
+                record(imported_exp[node.id], getattr(node, "lineno", None), any_refs, by_name=True)
             if isinstance(node, ast.arg):
                 return
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -160,7 +167,7 @@ def _scoped_class_refs(
                 walk(ch)
 
         walk(tree)
-    return refs
+    return refs, any_refs
 
 
 def _typing_dialect_map(src: Path, trees: dict[str, ast.Module]) -> dict[str, list[str]]:
@@ -322,7 +329,13 @@ def main() -> None:
                 pinned_ids.add(node.attr)
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 pinned_ids.add(node.name)
-    scoped_refs = _scoped_class_refs(trees, raw["lines"], old_masks)
+    scoped_refs, exp_any_refs = _scoped_class_refs(trees, raw["lines"], old_masks)
+    exp_usage: dict[str, int] = defaultdict(int, exp_any_refs)
+    for ckey, idx in raw["classes"].items():
+        if ckey.startswith("sqlglot.expressions."):
+            cname = ckey.rsplit(":", 1)[-1]
+            if "." not in cname and not cname.startswith("_"):
+                exp_usage[cname] |= old_masks[idx]
     typing_dialects = _typing_dialect_map(SOURCE, trees)
 
     # Strip false-positive `|EXPRESSION_METADATA` from import_reads/import_value_attrs (caused by class-body `.copy()`).
@@ -352,6 +365,7 @@ def main() -> None:
         return idx
 
     raw["class_refs"] = {c: intern(m) for c, m in sorted(scoped_refs.items()) if m}
+    raw["exp_usage"] = {c: intern(m) for c, m in sorted(exp_usage.items())}
     raw["sets"] = sets_bytes
     raw["sets_binary"] = True
 

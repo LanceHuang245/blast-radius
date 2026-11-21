@@ -152,6 +152,13 @@ def bool_context(parent: ast.AST | None, field: str | None) -> bool:
         return True
     if field == "ifs" and isinstance(parent, ast.comprehension):
         return True
+    if (
+        field == "args"
+        and isinstance(parent, ast.Call)
+        and isinstance(parent.func, ast.Name)
+        and parent.func.id == "bool"
+    ):
+        return True
     return False
 
 

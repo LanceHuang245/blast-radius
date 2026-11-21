@@ -111,6 +111,202 @@ def transform_subtest_method(mod, cls: type, method_name: str, ok_fn) -> bool:
     return True
 
 
+def split_independent_blocks(body: list[ast.stmt]) -> list[tuple[int, int]]:
+    """Partition top-level statements into contiguous independent local-variable groups."""
+    n = len(body)
+    if n < 2:
+        return [(0, n - 1)] if n else []
+
+    def vars_in(node: ast.AST) -> tuple[set[str], set[str], bool]:
+        reads: set[str] = set()
+        writes: set[str] = set()
+        mutates_state = False
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name):
+                if isinstance(sub.ctx, (ast.Store, ast.Del)):
+                    writes.add(sub.id)
+                elif isinstance(sub.ctx, ast.Load):
+                    reads.add(sub.id)
+            elif isinstance(sub, ast.Attribute) and isinstance(sub.ctx, (ast.Store, ast.Del)):
+                mutates_state = True
+            elif isinstance(sub, (ast.Global, ast.Nonlocal)):
+                mutates_state = True
+            elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                writes.add(sub.name)
+            elif isinstance(sub, (ast.Import, ast.ImportFrom)):
+                for alias in sub.names:
+                    writes.add(alias.asname or alias.name.split(".", 1)[0])
+        return reads, writes, mutates_state
+
+    stmt_rw = [vars_in(s) for s in body]
+    if any(m for _, _, m in stmt_rw):
+        return [(0, n - 1)]
+
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    last_write: dict[str, int] = {}
+    for i, (reads, writes, _) in enumerate(stmt_rw):
+        for var in reads:
+            if var in last_write:
+                for k in range(last_write[var], i + 1):
+                    union(last_write[var], k)
+        for var in writes:
+            last_write[var] = i
+
+    groups: list[tuple[int, int]] = []
+    i = 0
+    while i < n:
+        root = find(i)
+        j = i
+        while j + 1 < n and find(j + 1) == root:
+            j += 1
+        groups.append((i, j))
+        i = j + 1
+    return groups
+
+
+def transform_block_method(mod, cls: type, method_name: str, ok_fn) -> int:
+    """Replace `cls.<method_name>` in-place with an independent-block-filterable version; return block count."""
+    fn = cls.__dict__.get(method_name)
+    if fn is None:
+        return 0
+    prev = getattr(fn, "_br_block_count", 0)
+    if prev:
+        mod._br_block_ok = ok_fn
+        return prev
+    try:
+        src = textwrap.dedent(inspect.getsource(fn))
+        tree = ast.parse(src)
+    except Exception:
+        return 0
+    if not tree.body or not isinstance(tree.body[0], ast.FunctionDef):
+        return 0
+    if any(isinstance(n, ast.Name) and n.id == "super" for n in ast.walk(tree)):
+        return 0
+    fn_node = tree.body[0]
+    groups = split_independent_blocks(fn_node.body)
+    if len(groups) < 2:
+        return 0
+    new_body: list[ast.stmt] = []
+    for idx, (lo, hi) in enumerate(groups):
+        guard = ast.If(
+            test=ast.Call(
+                func=ast.Name(id="_br_block_ok", ctx=ast.Load()),
+                args=[ast.Constant(value=idx)],
+                keywords=[],
+            ),
+            body=fn_node.body[lo : hi + 1],
+            orelse=[],
+        )
+        ast.copy_location(guard, fn_node.body[lo])
+        new_body.append(guard)
+    fn_node.body = new_body
+    tree = ast.fix_missing_locations(tree)
+    mod._br_block_ok = ok_fn
+    local_ns: dict = {}
+    exec(compile(tree, getattr(mod, "__file__", "<blocks>"), "exec"), mod.__dict__, local_ns)
+    new_fn = local_ns.get(method_name)
+    if new_fn is None:
+        return 0
+    new_fn._br_block_count = len(groups)
+    setattr(cls, method_name, new_fn)
+    return len(groups)
+
+
+def _record_block_cases(mon, tool: int, src_prefix: str) -> dict[str, dict]:
+    """Record per-block line coverage and CPU weights for heavy multi-block unit tests."""
+    import sqlglot.generator as generator
+
+    targets = (
+        ("tests/test_optimizer.py", "TestOptimizer", "test_scope"),
+        ("tests/test_optimizer.py", "TestOptimizer", "test_deep_ast_type_annotation"),
+        ("tests/test_optimizer.py", "TestOptimizer", "test_values_annotation"),
+        ("tests/test_expressions.py", "TestExprs", "test_is_star"),
+        ("tests/test_executor.py", "TestExecutor", "test_scalar_functions"),
+    )
+    current_lines: set[tuple[str, int]] = set()
+    active = [False]
+    prefix_cut = len(src_prefix) - len("sqlglot/")
+
+    def on_line(code, line):
+        if active[0] and code.co_filename.startswith(src_prefix):
+            current_lines.add((code.co_filename[prefix_cut:], line))
+        return mon.DISABLE
+
+    mon.register_callback(tool, mon.events.LINE, on_line)
+    block_state = {"mask": None}
+
+    def _block_ok(idx: int) -> bool:
+        m = block_state["mask"]
+        return m is None or bool(m >> idx & 1)
+
+    per_test: dict[str, dict] = {}
+    setup_done: set[type] = set()
+    try:
+        for rel_file, cls_name, meth in targets:
+            mod = importlib.import_module(rel_file[:-3].replace("/", "."))
+            cls = getattr(mod, cls_name)
+            if cls not in setup_done and cls_name != "TestExecutor":
+                cls.setUpClass()
+                setup_done.add(cls)
+            n_blocks = transform_block_method(mod, cls, meth, _block_ok)
+            if n_blocks < 2 or n_blocks > 64:
+                continue
+            cur_lines: dict[str, dict[int, int]] = defaultdict(dict)
+            block_ms: list[int] = []
+            ok_all = True
+            for b in range(n_blocks):
+                block_state["mask"] = 1 << b
+                # Measure uninstrumented CPU weight for accurate ROI scaling.
+                t_b = time.process_time()
+                r0 = unittest.TestResult()
+                cls(meth).run(r0)
+                dt_ms = max(1, round((time.process_time() - t_b) * 1000))
+                if not r0.wasSuccessful():
+                    ok_all = False
+                    break
+                block_ms.append(dt_ms)
+                # Record sqlglot line coverage for block b.
+                generator._DISPATCH_CACHE.clear()
+                current_lines.clear()
+                active[0] = True
+                mon.restart_events()
+                mon.set_events(tool, mon.events.LINE)
+                r1 = unittest.TestResult()
+                cls(meth).run(r1)
+                mon.set_events(tool, 0)
+                active[0] = False
+                if not r1.wasSuccessful():
+                    ok_all = False
+                    break
+                bit = 1 << b
+                for rel, ln in current_lines:
+                    cur_lines[rel][ln] = cur_lines[rel].get(ln, 0) | bit
+            if ok_all:
+                tid = f"{rel_file}::{cls_name}::{meth}"
+                per_test[tid] = {
+                    "kind": "blocks",
+                    "count": n_blocks,
+                    "block_ms": block_ms,
+                    "lines": dict(cur_lines),
+                }
+    finally:
+        block_state["mask"] = None
+        mon.set_events(tool, 0)
+    return per_test
+
+
 def _collect_used_validator_returns() -> set[tuple[str, int]]:
     """Find (abs_path, lineno) of validate_identity/validate_transpile calls whose return value is used."""
     used: set[tuple[str, int]] = set()
@@ -740,6 +936,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
                     pickle.dump(q, handle, protocol=pickle.HIGHEST_PROTOCOL)
                 if not q["execute"]:
                     continue
+                t_exec = time.process_time()
                 opt_expr = serde_load(q["opt_dump"])
                 plan = Plan(opt_expr)
                 q_tables = {name: tables_by_name[name] for name in q["table_names"]}
@@ -748,7 +945,6 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
                 mon.restart_events()
                 for co in s2b_codes:
                     mon.set_local_events(tool, co, mon.events.LINE)
-                t_exec = time.process_time()
                 tables_ = ensure_tables(q_tables)
                 PythonExecutor(tables=tables_).execute(plan)
                 s2b_query_ms[idx] = max(1, round((time.process_time() - t_exec) * 1000))
@@ -995,6 +1191,7 @@ def main() -> None:
         lambda mon, tool: {
             **_record_optimizer_cases(mon, tool, src_prefix),
             **_record_extra_subtest_cases(mon, tool, src_prefix),
+            **_record_block_cases(mon, tool, src_prefix),
         },
     )
     pid_val = _spawn_recorder(val_tmp, lambda mon, tool: _record_validator_cases(mon, tool, src_prefix))
@@ -1065,9 +1262,10 @@ def main() -> None:
 
     n_cf = sum(1 for v in opt_cases.values() if v["kind"] == "check_file")
     n_st = sum(1 for v in opt_cases.values() if v["kind"] == "subtest")
+    n_blk = sum(1 for v in opt_cases.values() if v["kind"] == "blocks")
     print(
         f"case map in {time.perf_counter() - t0:.1f}s: "
-        f"{n_cf} check_file, {n_st} subtest, {len(val_cases)} validator, {len(tpc_cases)} tpc; "
+        f"{n_cf} check_file, {n_st} subtest, {n_blk} blocks, {len(val_cases)} validator, {len(tpc_cases)} tpc; "
         f"cases={CASES_FILE.stat().st_size / 1e6:.2f} MB, "
         f"ckpt_meta={TPCDS_CKPTS_META_FILE.stat().st_size / 1e3:.1f} KB, "
         f"ckpts={ckpt_bytes / 1e6:.2f} MB",

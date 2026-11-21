@@ -30,8 +30,8 @@ def main() -> None:
     impact = ImpactMap(MAP_FILE)
     # Uncalibrated tests are single-threaded unit/dialect tests whose measured in-process CPU
     # averages ~0.68x of recorded seconds (heavy multiprocess optimizer tests are calibrated).
-    # BR_CPU_SCALE: per-test CPU factor calibrated for the fast gc.freeze() runtime engine.
-    cpu_scale = float(os.environ.get("BR_CPU_SCALE", "1.0"))
+    # BR_CPU_SCALE: calibrated container overhead factor paired with MIN_ROI_RATIO (1.20 * 1.40 = 1.68x).
+    cpu_scale = float(os.environ.get("BR_CPU_SCALE", "1.20"))
     cpu_by_number = {
         t["number"]: round(impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 750)) * cpu_scale) for t in tests
     }
@@ -53,9 +53,9 @@ def main() -> None:
             # digest check costs ~0.25s and preserves Phase-2 + per-case edited_spans filtering.
             narrow_cost = _mask_cost_ms(sel.mask)
             coarse_cost = narrow_cost if sel.coarse_mask == sel.mask else _mask_cost_ms(sel.coarse_mask)
-            worth_check = (coarse_cost - narrow_cost >= 400) or (
-                coarse_cost >= 2500
-                and coarse_cost > narrow_cost
+            worth_check = (coarse_cost - narrow_cost >= 650) or (
+                coarse_cost >= 3500
+                and coarse_cost - narrow_cost >= 400
                 and (sel.hot_patch_targets is not None or sel.edited_spans is not None)
             )
             if worth_check and os.environ.get("BR_VERIFY", "1") != "0":

@@ -52,6 +52,8 @@ class Selection:
     # Every change resolved to these sqlglot statement spans (path, first, last), or None when
     # some change was resolved otherwise: lets the verifier rerun only fixture cases that reach them.
     edited_spans: list[tuple[str, int, int]] | None = None
+    # Source spans (head_lineno, end_lineno, has_future_annotations) for single-function hot-patch compile.
+    hot_patch_spans: dict[tuple[str, str], tuple[int, int, bool]] | None = None
 
 
 def _decorator_name(node: ast.expr) -> str | None:
@@ -205,15 +207,49 @@ def _extract_attr_hot_targets(
     return targets if targets else None
 
 
+def _narrow_added_dict_key(cls_key: str, attr: str, toks: tuple[str, ...], impact: ImpactMap) -> int | None:
+    """Soundly narrow a newly added `exp.<Cls>` key in a tracked class dict, or return None."""
+    exp_name = next((tok[2:] for tok in toks if tok.startswith("t:")), None)
+    if exp_name is None:
+        return None
+    if impact.pinned_identifiers and exp_name not in impact.pinned_identifiers:
+        return 0
+    exp_mask = impact.exp_class_usage(exp_name)
+    if exp_mask is None:
+        return None
+    return impact.attr_usage(cls_key, attr) & exp_mask
+
+
+def _tpc_fixture_inputs(text: str) -> tuple[int, list[tuple[str, str]]]:
+    """Extract (segment_count, [(meta, input_sql)]) matching tests/helpers.py load_sql_fixture_pairs."""
+    filtered = "\n".join(line for line in text.splitlines() if not line.startswith("--"))
+    stmts = filtered.split(";")
+    out: list[tuple[str, str]] = []
+    for i in range(0, len(stmts) - 1, 2):
+        raw = stmts[i].strip()
+        meta_lines: list[str] = []
+        sql_lines: list[str] = []
+        for ln in raw.splitlines():
+            if ln.startswith("#"):
+                meta_lines.append(ln)
+            else:
+                sql_lines.append(ln)
+        out.append(("\n".join(meta_lines), "\n".join(sql_lines).strip()))
+    return len(stmts), out
+
+
 def _extract_hot_patch_targets(
     path: str,
     old_scopes: Scopes,
     new_scopes: Scopes,
     hunks,
     runs_at_import,
-) -> list[tuple[str, str]] | None:
-    """Return [(path, qualname)] if every edit is strictly inside existing non-nested function bodies."""
+    ignore_ann: bool = False,
+) -> tuple[list[tuple[str, str]], dict[tuple[str, str], tuple[int, int, bool]]] | None:
+    """Return ([(path, qualname)], spans) if every edit is strictly inside existing non-nested function bodies."""
     targets: set[tuple[str, str]] = set()
+    spans: dict[tuple[str, str], tuple[int, int, bool]] = {}
+    fut_ann = new_scopes.has_future_annotations
     for removed, added in change_blocks(hunks):
         for old_no, _ in removed:
             fn = old_scopes.function_at(old_no)
@@ -230,9 +266,10 @@ def _extract_hot_patch_targets(
                 return None
             if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
                 return None
-            if ast.dump(old_node.args) != ast.dump(new_node.args):
+            if canon_ast(old_node.args, ignore_ann) != canon_ast(new_node.args, ignore_ann):
                 return None
             targets.add((path, qual))
+            spans[(path, qual)] = (new_fn[2], new_fn[1], fut_ann)
 
         for new_no, _anchor, _ in added:
             fn = new_scopes.function_at(new_no)
@@ -251,10 +288,11 @@ def _extract_hot_patch_targets(
                 return None
             if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
                 return None
-            if ast.dump(old_node.args) != ast.dump(new_node.args):
+            if canon_ast(old_node.args, ignore_ann) != canon_ast(new_node.args, ignore_ann):
                 return None
             targets.add((path, qual))
-    return sorted(targets)
+            spans[(path, qual)] = (new_rt[2], new_rt[1], fut_ann)
+    return sorted(targets), spans
 
 
 class Selector:
@@ -268,6 +306,7 @@ class Selector:
         self._no_verify: bool = False
         self._spans: list[tuple[str, int, int]] = []
         self._spans_ok: bool = True
+        self._block_used_values: bool = False
         self._owner_checks: set[str] = set()
         self._state = marshal.loads(STATE_FILE.read_bytes()) if STATE_FILE.is_file() else None
         self.values = None
@@ -278,6 +317,22 @@ class Selector:
             self.values = ValueMap(values_file, impact.test_ids)
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
         self.docs_mask = sum(1 << i for i in docs)
+        self._tpc_exec_bit: dict[str, int] = {
+            # TestExecutor.setUpClass loads tpc-ds.sql, and every TestExecutor test ignores its
+            # expected optimized SQL (only TestOptimizer.test_tpcds checks it).
+            "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": impact.by_class.get(
+                "tests/test_executor.py::TestExecutor", 0
+            ),
+            # For tpc-h.sql, only TestExecutor.test_optimized_tpch reads expected optimized SQL.
+            "tests/fixtures/optimizer/tpc-h/tpc-h.sql": impact.by_class.get(
+                "tests/test_executor.py::TestExecutor", 0
+            )
+            & ~sum(
+                1 << i
+                for i, t in enumerate(impact.test_ids)
+                if t == "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+            ),
+        }
 
     def old_source(self, path: str) -> tuple[str, Scopes]:
         if path not in self._old:
@@ -304,12 +359,15 @@ class Selector:
             all_fixture_or_noop = True
             patched_files: dict[str, str] = {}
             hot_targets: list[tuple[str, str]] | None = []
+            hot_spans: dict[tuple[str, str], tuple[int, int, bool]] = {}
             attr_targets: list[tuple[str, str, str, object]] | None = []
             self._hit_pp_lazy = False
             self._owner_checks = set()
             self._no_verify = False
             self._spans, self._spans_ok = [], True
+            self._hot_spans_cur: dict[tuple[str, str], tuple[int, int, bool]] = {}
             for file_patch in files:
+                self._hot_spans_cur = {}
                 file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets = self.select_file_detailed(
                     file_patch, patched_files
                 )
@@ -322,6 +380,7 @@ class Selector:
                 else:
                     if hot_targets is not None and f_targets:
                         hot_targets.extend(f_targets)
+                        hot_spans.update(self._hot_spans_cur)
                     if attr_targets is not None and a_targets:
                         attr_targets.extend(a_targets)
             # The extra passes below re-select with other settings: keep this pass's spans.
@@ -362,6 +421,7 @@ class Selector:
                 import_checks=owners,
                 coarse_mask=coarse_mask,
                 edited_spans=spans,
+                hot_patch_spans=hot_spans if hot_targets else None,
             )
         except Everything as reason:
             return Selection(impact.everything, f"everything ({reason})", {}, None, None, False)
@@ -411,8 +471,15 @@ class Selector:
             if not file.is_file():
                 raise Everything(f"no pinned fixture for {path}")
             old_text = file.read_text(encoding="utf-8")
-            patched_files[path] = apply(old_text, fp.hunks)
-            return self.select_fixture(path), False, True, [], []
+            new_text = apply(old_text, fp.hunks)
+            patched_files[path] = new_text
+            fmask = self.select_fixture(path)
+            # TestExecutor.test_execute_tpcds/tpch only read (meta, input_sql) and ignore the
+            # expected optimized output after `;`: strip them when inputs & metadata are unchanged.
+            exec_bit = self._tpc_exec_bit.get(path, 0)
+            if exec_bit and _tpc_fixture_inputs(old_text) == _tpc_fixture_inputs(new_text):
+                fmask &= ~exec_bit
+            return fmask, False, True, [], []
         if path in PYTEST_CONFIG_FILES:
             raise Everything(f"pytest configuration {path}")
         if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
@@ -517,11 +584,19 @@ class Selector:
         module = module_name(path)
         mask = 0
         self._coarse_block = False
+        all_blocks_used_values = bool(blocks)
         owners_before = set(self._owner_checks)
         for removed, added in blocks:
+            self._block_used_values = False
             mask |= self.select_block(path, module, old_scopes, new_scopes, removed, added, ignore_ann)
+            all_blocks_used_values = all_blocks_used_values and self._block_used_values
 
-        if self.values is not None and mask and path.startswith("sqlglot/"):
+        if (
+            self.values is not None
+            and mask
+            and path.startswith("sqlglot/")
+            and (not all_blocks_used_values or self._owner_checks != owners_before)
+        ):
             # Every difference is a rearranged condition over the same operands: replay the
             # pinned run's recorded outcomes (import-time ones included) through the edit.
             try:
@@ -543,8 +618,11 @@ class Selector:
             # only in imports whose built state the runtime proves unchanged: either way, swapping
             # __code__ after a pre-warmed import matches importing the patched module.
             ran_before = self.runs_before_tests if self._coarse_block else (lambda *_: False)
-            targets = _extract_hot_patch_targets(path, old_scopes, new_scopes, hunks, ran_before)
-            if targets is None:
+            hp_res = _extract_hot_patch_targets(path, old_scopes, new_scopes, hunks, ran_before, ignore_ann)
+            if hp_res is not None:
+                targets, hspans = hp_res
+                self._hot_spans_cur.update(hspans)
+            else:
                 attr_targets = _extract_attr_hot_targets(path, module, old_scopes, new_scopes, hunks, self.impact)
         return mask, False, new_text, targets, attr_targets
 
@@ -590,7 +668,6 @@ class Selector:
             return ast_mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
 
         self._coarse_block = True
-        self._spans_ok = False
         mask = 0
         for lineno, _ in removed:
             mask |= self.old_line(path, module, old_scopes, new_scopes, lineno)
@@ -647,25 +724,35 @@ class Selector:
         if old_spreads != new_spreads:
             return None
         # _TrackedDict records key hits, not misses: key removals, reorderings, and value
-        # edits are exact; newly added keys fall back conservatively.
-        if not (set(new_entries) <= set(old_entries)):
-            return None
+        # edits are exact; newly added `exp.<Cls>` keys narrow via (attr_usage & exp_class_usage).
+        added_keys = [toks for toks in new_entries if toks not in old_entries]
         changed_keys = [
             toks
             for toks in old_entries
             if toks not in new_entries or ast.dump(old_entries[toks]) != ast.dump(new_entries[toks])
         ]
         same_order = list(old_entries) == list(new_entries)
-        if not changed_keys and same_order:
+        if not changed_keys and not added_keys and same_order:
             return 0
         impact = self.impact
         mask = 0
         changed_tokens = [t for toks in changed_keys for t in toks]
+        added_tokens = [t for toks in added_keys for t in toks]
         for cls_key in impact.typing_dialects.get(path, ()):
-            if not same_order and (cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, "EXPRESSION_METADATA")):
+            if not same_order and (
+                cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, "EXPRESSION_METADATA", [])
+            ):
                 return None
             if changed_tokens and impact.read_at_import(cls_key, "EXPRESSION_METADATA", changed_tokens):
                 return None
+            if added_keys:
+                if cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, "EXPRESSION_METADATA", added_tokens):
+                    return None
+                for toks in added_keys:
+                    narrowed = _narrow_added_dict_key(cls_key, "EXPRESSION_METADATA", toks, impact)
+                    if narrowed is None:
+                        return None
+                    mask |= narrowed
             mask |= impact.dict_key_usage(cls_key, "EXPRESSION_METADATA", "*")
             for toks in changed_keys:
                 for tok in toks:
@@ -737,12 +824,13 @@ class Selector:
                     old_entries, old_spreads = old_parsed
                     new_entries, new_spreads = new_parsed
                     # _TrackedDict records key hits, not misses: key removals, reorderings (when
-                    # no import-time key iteration exists), and value edits are exact; added keys
-                    # fall back conservatively.
-                    if old_spreads == new_spreads and set(new_entries) <= set(old_entries):
+                    # no import-time key iteration exists), and value edits are exact; newly added
+                    # `exp.<Cls>` keys narrow via (attr_usage & exp_class_usage).
+                    if old_spreads == new_spreads:
+                        added_keys = [toks for toks in new_entries if toks not in old_entries]
                         same_order = list(old_entries) == list(new_entries)
                         if not same_order and (
-                            cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, attr)
+                            cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, attr, [])
                         ):
                             return None
                         changed_keys = [
@@ -750,12 +838,21 @@ class Selector:
                             for toks in old_entries
                             if toks not in new_entries or ast.dump(old_entries[toks]) != ast.dump(new_entries[toks])
                         ]
-                        if not changed_keys and same_order:
+                        if not changed_keys and not added_keys and same_order:
                             return 0
                         changed_tokens = [tok for toks in changed_keys for tok in toks]
                         if changed_tokens and impact.read_at_import(cls_key, attr, changed_tokens):
                             return None
                         mask = impact.dict_key_usage(cls_key, attr, "*")
+                        if added_keys:
+                            added_tokens = [tok for toks in added_keys for tok in toks]
+                            if cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, attr, added_tokens):
+                                return None
+                            for toks in added_keys:
+                                narrowed = _narrow_added_dict_key(cls_key, attr, toks, impact)
+                                if narrowed is None:
+                                    return None
+                                mask |= narrowed
                         for toks in changed_keys:
                             for tok in toks:
                                 mask |= impact.dict_key_usage(cls_key, attr, tok)
@@ -773,6 +870,7 @@ class Selector:
         checked_funcs: set[str] = set()
         old_lines = {n for n, _ in removed}
         new_lines = {n for n, _, _ in added}
+        all_narrowed = bool(removed)
         for (old_no, old_text), (new_no, _anchor, new_text) in zip(removed, added):
             if indent(old_text) != indent(new_text):
                 return None
@@ -790,6 +888,7 @@ class Selector:
                 checked_funcs.add(qualname)
             if old_no in old_scopes.docstrings:
                 mask |= self.docs_mask
+                all_narrowed = False
                 continue
             statement = old_scopes.statement_at(old_no)
             if statement is None:
@@ -818,10 +917,13 @@ class Selector:
                             self._spans.append((path, start, stop))
                             mask |= vmask & self.impact.span(path, start, stop)
                             continue
+            all_narrowed = False
             span = self._test_time_span(path, start, stop)
             if span is None:
                 return None
             mask |= span
+        if all_narrowed:
+            self._block_used_values = True
         return mask
 
     def _test_time_span(self, path: str, first: int, last: int) -> int | None:
@@ -1025,12 +1127,17 @@ class Selector:
 
     def function_level(self, path, module, body_start, end) -> int:
         mask = self.impact.span(path, body_start, end)
+        if self.runs_before_tests(path, body_start, end):
+            self._spans_ok = False
+        else:
+            self._spans.append((path, body_start, end))
         if self.runs_at_import(path, body_start, end):
             mask |= self._module_reach(path)
         return mask
 
     def container_level(self, path, module, scopes, lineno) -> int:
         """An import-time change at this line: its class's users & refs, or the whole module's reach."""
+        self._spans_ok = False
         impact = self.impact
         cls = scopes.class_at(lineno)
         if cls is not None:
@@ -1077,6 +1184,10 @@ class Selector:
             mask = self.impact.span(path, span[0], span[1])
             if lineno == span[0]:
                 mask |= self.container_level(path, module, scopes, lineno)
+            elif self.runs_before_tests(path, span[0], span[1]):
+                self._spans_ok = False
+            else:
+                self._spans.append((path, span[0], span[1]))
             return mask
         mask = self.container_level(path, module, scopes, lineno)
         if lineno in scopes.docstrings:
@@ -1117,6 +1228,10 @@ class Selector:
             for probe in (anchor - 1, anchor):
                 span = old_scopes.lambda_at(probe)
                 if span is not None and span[0] < probe <= span[1]:
+                    if self.runs_before_tests(path, span[0], span[1]):
+                        self._spans_ok = False
+                    else:
+                        self._spans.append((path, span[0], span[1]))
                     return self.impact.span(path, span[0], span[1])
         mask = self.container_level(path, module, new_scopes, new_lineno)
         if new_lineno in new_scopes.docstrings:

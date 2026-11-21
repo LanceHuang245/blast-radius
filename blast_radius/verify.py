@@ -30,6 +30,7 @@ import pickle
 import select
 import signal
 import sys
+import textwrap
 import time
 import types
 import unittest
@@ -59,11 +60,11 @@ from blast_radius.tpc_verify import (
 # Decision thresholds (overridable via env vars for local A/B benchmarking).
 MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "6000"))
 MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "6000"))
-MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "200"))
-MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "400"))
-MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.12"))
+MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "300"))
+MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "550"))
+MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.40"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
-TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "85000"))
+TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "45000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
@@ -129,9 +130,10 @@ class VerifyTask:
     tpc_mode: str | None = None
     lazy_pp_nums: set[int] = field(default_factory=set)
     decap_targets: list[int] = field(default_factory=list)
-    # Fine-grained case/subTest/Validator/TPC filters and their scaled CPU estimates.
+    # Fine-grained case/subTest/block/Validator/TPC filters and their scaled CPU estimates.
     case_filter: dict[int, set[tuple[str, int]]] = field(default_factory=dict)
     subtest_filter: dict[int, tuple[int, int]] = field(default_factory=dict)
+    block_filter: dict[int, int] = field(default_factory=dict)
     validator_filter: dict[int, tuple[int, int]] = field(default_factory=dict)
     tpc_query_mask: dict[int, int] = field(default_factory=dict)
     tpc_s2b_query_mask: dict[int, int] = field(default_factory=dict)
@@ -343,7 +345,51 @@ def _find_unique_code(parent_code: types.CodeType, steps: list[str]) -> types.Co
     return cur
 
 
-def _apply_code_hotpatch(patched_files: dict[str, str], targets: list[tuple[str, str]]) -> bool:
+def _compile_single_func(
+    lines: list[str],
+    filename: str,
+    steps: list[str],
+    span: tuple[int, int, bool],
+    old_code: types.CodeType,
+) -> types.CodeType | None:
+    """Compile only the patched function slice (~0.3ms vs ~180ms for full parser.py)."""
+    head_lineno, end_lineno, fut_ann = span
+    if head_lineno < 1 or end_lineno > len(lines) or head_lineno > end_lineno:
+        return None
+    try:
+        snippet = textwrap.dedent("".join(lines[head_lineno - 1 : end_lineno]))
+        hdr: list[str] = []
+        indent_prefix = ""
+        if fut_ann:
+            hdr.append("from __future__ import annotations\n")
+        for cls_name in steps[:-1]:
+            hdr.append(f"{indent_prefix}class {cls_name}:\n")
+            indent_prefix += "    "
+        body_src = textwrap.indent(snippet, indent_prefix) if indent_prefix else snippet
+        pad_n = max(0, head_lineno - 1 - len(hdr))
+        if fut_ann:
+            src = hdr[0] + ("\n" * pad_n) + "".join(hdr[1:]) + body_src
+        else:
+            src = ("\n" * pad_n) + "".join(hdr) + body_src
+        mini_code = compile(src, filename, "exec")
+        new_code = _find_unique_code(mini_code, steps)
+        if new_code is None:
+            return None
+        if (
+            new_code.co_freevars != old_code.co_freevars
+            or new_code.co_cellvars != old_code.co_cellvars
+        ):
+            return None
+        return new_code
+    except Exception:
+        return None
+
+
+def _apply_code_hotpatch(
+    patched_files: dict[str, str],
+    targets: list[tuple[str, str]],
+    hot_patch_spans: dict[tuple[str, str], tuple[int, int, bool]] | None = None,
+) -> bool:
     """Swap __code__ in-place on live sqlglot functions inside the forked Phase-2 child."""
     by_path: dict[str, list[str]] = {}
     for rel_path, qualname in targets:
@@ -355,12 +401,11 @@ def _apply_code_hotpatch(patched_files: dict[str, str], targets: list[tuple[str,
             return False
         mod_name = module_name(rel_path)
         mod = importlib.import_module(mod_name)
-        mod_code = compile(text, str((SOURCE / rel_path).resolve()), "exec")
+        filename = str((SOURCE / rel_path).resolve())
+        lines: list[str] | None = None
+        mod_code: types.CodeType | None = None
         for qualname in qualnames:
             steps = qualname.split(".")
-            new_code = _find_unique_code(mod_code, steps)
-            if new_code is None:
-                return False
             container: object = mod
             for part in steps[:-1]:
                 container = container.__dict__.get(part) if hasattr(container, "__dict__") else None
@@ -379,6 +424,18 @@ def _apply_code_hotpatch(patched_files: dict[str, str], targets: list[tuple[str,
             if not inspect.isfunction(fn):
                 return False
             old_code = fn.__code__
+            new_code: types.CodeType | None = None
+            span = hot_patch_spans.get((rel_path, qualname)) if hot_patch_spans else None
+            if span is not None:
+                if lines is None:
+                    lines = text.splitlines(keepends=True)
+                new_code = _compile_single_func(lines, filename, steps, span, old_code)
+            if new_code is None:
+                if mod_code is None:
+                    mod_code = compile(text, filename, "exec")
+                new_code = _find_unique_code(mod_code, steps)
+            if new_code is None:
+                return False
             if (
                 old_code.co_freevars != new_code.co_freevars
                 or old_code.co_cellvars != new_code.co_cellvars
@@ -551,6 +608,7 @@ _CASE_STATE: dict = {
     "subtest_mask": None,
     "subtest_stride": 1,
     "subtest_idx": 0,
+    "block_mask": None,
     "val_mask": None,
     "val_stride": 1,
     "val_idx": 0,
@@ -565,6 +623,11 @@ def _br_subtest_ok() -> bool:
     idx = _CASE_STATE["subtest_idx"]
     _CASE_STATE["subtest_idx"] = idx + 1
     return bool(mask >> (idx // _CASE_STATE["subtest_stride"]) & 1)
+
+
+def _br_block_ok(idx: int) -> bool:
+    mask = _CASE_STATE["block_mask"]
+    return mask is None or bool(mask >> idx & 1)
 
 
 def _install_case_filter(mod) -> None:
@@ -603,6 +666,15 @@ def _install_subtest_filter(mod, cls: type, meth_name: str) -> None:
         transform_subtest_method(mod, cls, meth_name, _br_subtest_ok)
 
 
+def _install_block_filter(mod, cls: type, meth_name: str) -> None:
+    """Lazily wrap `cls.<meth_name>` so independent top-level statement blocks can filter by bitmask."""
+    fn = cls.__dict__.get(meth_name)
+    if fn is not None and not getattr(fn, "_br_block_count", 0):
+        from blast_radius.precompile_cases import transform_block_method
+
+        transform_block_method(mod, cls, meth_name, _br_block_ok)
+
+
 def _install_validator_filter() -> None:
     """Wrap Validator.validate_identity/validate_all/validate_transpile once to skip unreached calls."""
     from tests.dialects.test_dialect import Validator
@@ -635,7 +707,7 @@ def _install_validator_filter() -> None:
 
 def _can_fast_opt_tpch(sel: Selection) -> bool:
     return not any(
-        p in ("tests/test_executor.py", "tests/helpers.py") or p.startswith("tests/fixtures/")
+        p in ("tests/test_executor.py", "tests/helpers.py") or p.startswith("tests/fixtures/optimizer/tpc-h/")
         for p in sel.patched_files
     )
 
@@ -876,7 +948,11 @@ def _start_child_verification(
         else:
             _install_open_overlay(task.selection.patched_files)
             if task.selection.hot_patch_targets:
-                if not _apply_code_hotpatch(task.selection.patched_files, task.selection.hot_patch_targets):
+                if not _apply_code_hotpatch(
+                    task.selection.patched_files,
+                    task.selection.hot_patch_targets,
+                    task.selection.hot_patch_spans,
+                ):
                     os.write(w_fd, b"FAIL_PATCH")
                     os.close(w_fd)
                     os._exit(0)
@@ -942,9 +1018,12 @@ def _start_child_verification(
                         setup_done.add(cls)
                 cls = loaded_classes[key]
                 sub_spec = task.subtest_filter.get(num)
+                blk_mask = task.block_filter.get(num)
                 val_spec = task.validator_filter.get(num)
                 if sub_spec is not None:
                     _install_subtest_filter(loaded_mods[mod_name], cls, meth_name)
+                if blk_mask is not None:
+                    _install_block_filter(loaded_mods[mod_name], cls, meth_name)
                 if val_spec is not None:
                     _install_validator_filter()
                 res = unittest.TestResult()
@@ -954,6 +1033,7 @@ def _start_child_verification(
                 else:
                     _CASE_STATE["subtest_mask"], _CASE_STATE["subtest_stride"] = None, 1
                 _CASE_STATE["subtest_idx"] = 0
+                _CASE_STATE["block_mask"] = blk_mask
                 if val_spec is not None:
                     _CASE_STATE["val_mask"], _CASE_STATE["val_stride"] = val_spec
                 else:
@@ -967,6 +1047,7 @@ def _start_child_verification(
             finally:
                 _CASE_STATE["allowed"] = None
                 _CASE_STATE["subtest_mask"] = None
+                _CASE_STATE["block_mask"] = None
                 _CASE_STATE["val_mask"] = None
                 _CASE_STATE["val_depth"] = 0
                 signal.alarm(0)
@@ -1154,12 +1235,12 @@ def _start_child_verification(
             per_mod_ms = 20 if task.phase == 1 else 4
             step2c_t0 = time.process_time()
             step2c_est_ms = 0
-            for _ in range(12):
-                if step2c_est_ms > 10000 or time.process_time() - step2c_t0 > 18.0:
+            for _ in range(5):
+                if step2c_est_ms > 5000 or time.process_time() - step2c_t0 > 12.0:
                     break
-                if len(failed) >= 6 and len(failed) >= 2 * max(len(passed), 1):
+                if len(failed) >= 2 and not passed:
                     break
-                cur_roi = 2.0 if (len(failed) >= 3 and len(failed) >= len(passed)) else MIN_ROI_RATIO
+                cur_roi = 2.5 if (len(failed) >= 2 and len(failed) >= len(passed)) else MIN_ROI_RATIO
                 batch = _best_drop_prefix(
                     task.chosen - passed,
                     verifiable - passed - failed - decap_set,
@@ -1202,15 +1283,17 @@ def _case_plan(
 ) -> tuple[
     dict[int, set[tuple[str, int]]],
     dict[int, tuple[int, int]],
+    dict[int, int],
     dict[int, tuple[int, int]],
     dict[int, int],
     dict[int, int],
     dict[int, int],
 ]:
-    """Compute per-case/subTest/Validator/TPC query filters and scaled CPU estimates for `chosen`."""
+    """Compute per-case/subTest/block/Validator/TPC query filters and scaled CPU estimates for `chosen`."""
     global _CASE_MAP
     case_filter: dict[int, set[tuple[str, int]]] = {}
     subtest_filter: dict[int, tuple[int, int]] = {}
+    block_filter: dict[int, int] = {}
     validator_filter: dict[int, tuple[int, int]] = {}
     tpc_query_mask: dict[int, int] = {}
     tpc_s2b_query_mask: dict[int, int] = {}
@@ -1265,20 +1348,32 @@ def _case_plan(
                 matched = {tuple(cases[k]) for k in range(len(cases)) if mask >> k & 1}
                 if len(matched) < len(cases):
                     case_filter[num] = matched
-                    cpu_override[num] = max(25, base_cpu[num] * (len(matched) + 1) // (len(cases) + 1))
+                    cpu_override[num] = max(40, base_cpu[num] * (len(matched) + 1) // (len(cases) + 1) + 20)
             elif kind == "subtest":
                 count = entry["count"]
                 hits = mask.bit_count()
                 if hits < count:
                     subtest_filter[num] = (mask, entry.get("stride", 1))
-                    cpu_override[num] = max(25, base_cpu[num] * (hits + 1) // (count + 1))
+                    cpu_override[num] = max(40, base_cpu[num] * (hits + 1) // (count + 1) + 20)
+            elif kind == "blocks":
+                count = entry["count"]
+                hits = mask.bit_count()
+                if hits < count:
+                    block_filter[num] = mask
+                    b_ms = entry.get("block_ms")
+                    if b_ms and len(b_ms) == count:
+                        tot_b = max(sum(b_ms), 1)
+                        hit_b = sum(b_ms[i] for i in range(count) if mask >> i & 1)
+                        cpu_override[num] = max(25, base_cpu[num] * hit_b // tot_b + 15)
+                    else:
+                        cpu_override[num] = max(25, base_cpu[num] * (hits + 1) // (count + 1) + 15)
             elif kind == "validator":
                 count = entry["count"]
                 full_mask = mask | entry.get("always", 0)
                 hits = full_mask.bit_count()
                 if hits < count:
                     validator_filter[num] = (full_mask, entry.get("stride", 1))
-                    cpu_override[num] = max(12, base_cpu[num] * (hits + 1) // (count + 1))
+                    cpu_override[num] = max(22, base_cpu[num] * (hits + 1) // (count + 1) + 10)
 
     # Apply TPC-DS optimizer rule-stage checkpoint/suffix-span CPU estimate to TestOptimizer.test_tpcds.
     span_info = select_tpcds_span(sel.patched_files, max_start=14, for_exec=False, edited_spans=sel.edited_spans)
@@ -1292,7 +1387,7 @@ def _case_plan(
                     scaled = ckpt_est_ms
                 cpu_override[num] = min(cpu_override.get(num, base_cpu[num]), scaled)
 
-    return case_filter, subtest_filter, validator_filter, tpc_query_mask, tpc_s2b_query_mask, cpu_override
+    return case_filter, subtest_filter, block_filter, validator_filter, tpc_query_mask, tpc_s2b_query_mask, cpu_override
 
 
 def plan_verification(
@@ -1307,9 +1402,15 @@ def plan_verification(
     for commit, chosen, sel in commits:
         if not chosen or not sel.patched_files or sel.reason.startswith("everything"):
             continue
-        case_filter, subtest_filter, validator_filter, tpc_query_mask, tpc_s2b_query_mask, cpu_override = _case_plan(
-            chosen, sel, id_by_number, base_cpu
-        )
+        (
+            case_filter,
+            subtest_filter,
+            block_filter,
+            validator_filter,
+            tpc_query_mask,
+            tpc_s2b_query_mask,
+            cpu_override,
+        ) = _case_plan(chosen, sel, id_by_number, base_cpu)
         cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else base_cpu
         tids = [id_by_number[n] for n in chosen]
         verifiable = {n for n in chosen if id_by_number[n] not in SUBPROCESS_TESTS}
@@ -1368,7 +1469,7 @@ def plan_verification(
                     raw_decap.append((sim_ms, c_ms, num))
             elif sim_ms >= 150:
                 c_ms = cpu_by_number[num]
-                if c_ms <= sim_ms * 0.85:
+                if c_ms <= sim_ms * 0.75:
                     raw_decap.append((sim_ms, c_ms, num))
 
         # Pick the prefix with the best net makespan / worker-count reduction, trying two
@@ -1395,7 +1496,7 @@ def plan_verification(
                 new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial_pool])
                 net = (static_cost_ms - new_cost) - acc_decap_cpu - (15 if lazy_pp_nums else 0)
                 chosen_decap.append(num)
-                if net >= order_best + 100:
+                if net >= order_best + 200:
                     order_best, order_prefix = net, list(chosen_decap)
             if order_best > best_net:
                 best_net, best_prefix = order_best, order_prefix
@@ -1461,6 +1562,7 @@ def plan_verification(
                 decap_targets=decap_targets,
                 case_filter=case_filter,
                 subtest_filter=subtest_filter,
+                block_filter=block_filter,
                 validator_filter=validator_filter,
                 tpc_query_mask=tpc_query_mask,
                 tpc_s2b_query_mask=tpc_s2b_query_mask,
@@ -1522,6 +1624,10 @@ def _prewarm_for_phase2(
         first_mod = first_file[:-3].replace("/", ".")
         if first_mod != "tests.test_executor":
             needed_mods.add(first_mod)
+        for num in task.decap_targets:
+            dmod = id_by_number[num].split("::", 1)[0][:-3].replace("/", ".")
+            if dmod != "tests.test_executor":
+                needed_mods.add(dmod)
         task_mods = {id_by_number[n].split("::", 1)[0][:-3].replace("/", ".") for n in verifiable}
         for mod in task_mods:
             mod_task_count[mod] = mod_task_count.get(mod, 0) + 1
@@ -1567,6 +1673,13 @@ def _prewarm_for_phase2(
                 mod = sys.modules.get(mod_name)
                 if mod is not None and hasattr(mod, parts[1]):
                     _install_subtest_filter(mod, getattr(mod, parts[1]), parts[2])
+        for num in task.block_filter:
+            parts = id_by_number[num].split("::")
+            if len(parts) == 3:
+                mod_name = parts[0][:-3].replace("/", ".")
+                mod = sys.modules.get(mod_name)
+                if mod is not None and hasattr(mod, parts[1]):
+                    _install_block_filter(mod, getattr(mod, parts[1]), parts[2])
 
 
 def _run_batch_parallel(

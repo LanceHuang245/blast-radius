@@ -41,6 +41,7 @@ class ImpactMap:
         self.lazy_importers: dict[str, list[list]] = raw.get("lazy_importers", {})
         self.typing_dialects: dict[str, list[str]] = raw.get("typing_dialects", {})
         self.pinned_identifiers: set[str] = set(raw.get("pinned_identifiers", []))
+        self.exp_usage: dict[str, int] = raw.get("exp_usage", {})
         self.real_cpu_ms: dict[str, int] = raw.get("real_cpu_ms", {})
         self.everything = (1 << len(self.test_ids)) - 1
 
@@ -112,6 +113,10 @@ class ImpactMap:
     def attr_usage(self, cls_key: str, attr: str) -> int:
         index = self.attrs.get(f"{cls_key}|{attr}")
         return 0 if index is None else self.mask(index)
+
+    def exp_class_usage(self, name: str) -> int | None:
+        index = self.exp_usage.get(name)
+        return None if index is None else self.mask(index)
 
     def read_at_import(self, cls_key: str, attr: str, tokens: list[str] | None = None) -> bool:
         """Was this class attribute read while sqlglot imported? For a dict, pass the

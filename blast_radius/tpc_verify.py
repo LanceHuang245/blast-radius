@@ -54,24 +54,26 @@ TPC_DISALLOWED_FILES = frozenset({
 })
 
 # Fallback Linux CPU estimates (ms); exact per-query timings are measured on the build host
-# in precompile_cases.py (s2b_query_ms) and used automatically when available.
+# in precompile_cases.py (s2b_query_ms) and used automatically when s2b_query_mask narrows queries.
+# Full 99-query tpcds fast_b/full_cached exceed test_execute_tpcds's 21.45s simulated cost.
+# All 22 tpch queries have execute=False (parse_one only), so tpch verification takes <100ms.
 TPC_EST_CPU_MS = {
     ("tpcds", "fast_a"): 3000,
-    ("tpcds", "fast_b"): 12800,
-    ("tpcds", "full_cached"): 16500,
-    ("tpch", "fast_a"): 450,
-    ("tpch", "fast_b"): 1500,
-    ("tpch", "full_cached"): 2000,
+    ("tpcds", "fast_b"): 25000,
+    ("tpcds", "full_cached"): 29000,
+    ("tpch", "fast_a"): 80,
+    ("tpch", "fast_b"): 30,
+    ("tpch", "full_cached"): 100,
 }
 
 # fast_a re-executes queries whose optimized plan changed; cheapest queries run first so broken
 # commits fail fast. Primary budget uses deterministic precompiled s2b_query_ms (identical across
 # all 3 scorer runs); TPC_REEXEC_BUDGET_S is an emergency hard CPU ceiling.
-TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "25"))
-TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "7500"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "12.0"))
-TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "10"))
-TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "5.0"))
+TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "12"))
+TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "4000"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "5.0"))
+TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "12"))
+TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "3.0"))
 
 _meta_cache: dict | None = None
 _ckpts_meta_cache: dict | None = None
@@ -267,24 +269,26 @@ def est_tpc_mode_ms(
     s1_mask: int | None = None,
 ) -> int:
     """Estimate TPC CPU (ms) accounting for untouched sub-stages, checkpoints, and exact per-query timings."""
+    if suite_name == "tpch":
+        return TPC_EST_CPU_MS[("tpch", mode)]
     if mode == "fast_a":
         return est_tpc_fast_a_ms(suite_name, patched_files, s1_matched, total_queries, edited_spans)
+    base = TPC_EST_CPU_MS[(suite_name, mode)]
     meta = load_tpcds_ckpts_meta()
     q_ms = (meta.get("s2b_query_ms") or {}).get(suite_name) if meta else None
     if q_ms and len(q_ms) == total_queries:
         if mode == "fast_b":
             if s2b_mask is not None:
                 total = sum(q_ms[i] for i in range(total_queries) if s2b_mask >> i & 1)
-                return max(150, total + 120)
-            return max(500, sum(q_ms) + 250)
+                return max(150, total + 180)
+            return max(base, sum(q_ms) + 400)
         if mode == "full_cached":
             s1_est = est_tpc_fast_a_ms(suite_name, patched_files, s1_matched, total_queries, edited_spans)
             if s1_mask is not None and s2b_mask is not None:
                 fm = s1_mask | s2b_mask
                 s2_est = sum(q_ms[i] for i in range(total_queries) if fm >> i & 1)
-                return max(250, s1_est + s2_est + 150)
-            return max(800, s1_est + sum(q_ms) + 250)
-    base = TPC_EST_CPU_MS[(suite_name, mode)]
+                return max(250, s1_est + s2_est + 200)
+            return max(base, s1_est + sum(q_ms) + 400)
     if mode == "fast_b" and s2b_matched is not None and total_queries > 0:
         return max(150, base * (s2b_matched + 1) // (total_queries + 1))
     if mode == "full_cached" and total_queries > 0:
@@ -384,16 +388,23 @@ def select_tpc_mode(sel: Selection) -> str | None:
     if meta is None or not TPC_STAGE1_FILE.is_file() or not TPC_STAGE2_FILE.is_file():
         return None
     for path in sel.patched_files:
-        if path in TPC_DISALLOWED_FILES or path.startswith("tests/fixtures/"):
+        if path in TPC_DISALLOWED_FILES or path.startswith(
+            ("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/")
+        ):
             return None
+
+    sqlglot_or_non_tpc_fixture = all(
+        p.startswith("sqlglot/")
+        or (
+            p.startswith("tests/fixtures/")
+            and not p.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/"))
+        )
+        for p in sel.patched_files
+    )
 
     # Function-body-only edits inside sqlglot/: if zero edited functions execute in Stage 2b,
     # Stage-1/2a bit-for-bit output parity proves Stage 2b receives identical inputs and code.
-    if (
-        sel.hot_patch_targets
-        and not sel.attr_hot_targets
-        and all(p.startswith("sqlglot/") for p in sel.patched_files)
-    ):
+    if sel.hot_patch_targets and not sel.attr_hot_targets and sqlglot_or_non_tpc_fixture:
         edited_pairs = {(rel_path, qual.rsplit(".", 1)[-1]) for rel_path, qual in sel.hot_patch_targets}
         touches_s1 = any(pair in meta["stage1_funcs"] for pair in edited_pairs)
         touches_s2b = any(pair in meta["stage2b_funcs"] for pair in edited_pairs)
@@ -408,7 +419,7 @@ def select_tpc_mode(sel: Selection) -> str | None:
     # Any edit (class attributes, module level, several files) outside every file that runs code
     # in Stage 2b leaves Stage 2b's code unchanged; fast_a checks its inputs (re-executing the
     # queries whose plans changed).
-    if all(p.startswith("sqlglot/") and p not in meta["stage2b_files"] for p in sel.patched_files):
+    if sqlglot_or_non_tpc_fixture and all(p not in meta["stage2b_files"] for p in sel.patched_files):
         return "fast_a"
 
     return "full_cached"
@@ -576,7 +587,7 @@ def verify_tpc_test(
                     _why(f"{suite_name}: python codegen changed")
                     return False
 
-        def same_rows_as_pinned(index: int, sql: str, opt_expr=None) -> bool:
+        def same_rows_as_pinned(index: int, sql: str, opt_expr=None, plan=None) -> bool:
             """Run one query the way the real test does and compare its rows to the pinned run."""
             from sqlglot.executor import execute
             nonlocal s2_meta
@@ -594,7 +605,9 @@ def verify_tpc_test(
                         with open(tpc_s2_table_file(suite_name, name), "rb") as handle:
                             s2_tables_cache[name] = pickle.load(handle)
                     tables[name] = Table(columns=schema_map[name], rows=list(s2_tables_cache[name]))
-                if opt_expr is not None:
+                if plan is not None:
+                    res = PythonExecutor(tables=ensure_tables(tables)).execute(plan)
+                elif opt_expr is not None:
                     res = PythonExecutor(tables=ensure_tables(tables)).execute(Plan(opt_expr))
                 else:
                     res = execute(parse_one(sql), schema=schema_map, tables=tables)
@@ -609,7 +622,9 @@ def verify_tpc_test(
                 name: Table(columns=s2["schema"][name], rows=list(s2["tables_raw"][name]))
                 for name in q2["table_names"]
             }
-            if opt_expr is not None:
+            if plan is not None:
+                res = PythonExecutor(tables=ensure_tables(tables)).execute(plan)
+            elif opt_expr is not None:
                 res = PythonExecutor(tables=ensure_tables(tables)).execute(Plan(opt_expr))
             else:
                 res = execute(parse_one(sql), schema=s2["schema"], tables=tables)
@@ -619,10 +634,11 @@ def verify_tpc_test(
         duck_count = 0
         duck_cpu = 0.0
         duck_conn = None
+        duck_loaded_tables: set[str] = set()
         reexec_count = 0
         reexec_cpu = 0.0
 
-        def _check_changed_duck(index: int, new_sql: str, old_sql: str) -> bool:
+        def _check_changed_duck(index: int, new_sql: str, old_sql: str, table_names: list[str]) -> bool:
             nonlocal duck_count, duck_cpu, duck_conn
             duck_count += 1
             if duck_count > TPC_DUCK_MAX_QUERIES or duck_cpu > TPC_DUCK_BUDGET_S:
@@ -630,17 +646,21 @@ def verify_tpc_test(
                 return False
             t0 = time.process_time()
             try:
+                from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA
+
+                schema, folder = (TPCDS_SCHEMA, "tpc-ds") if suite_name == "tpcds" else (TPCH_SCHEMA, "tpc-h")
                 if duck_conn is None:
                     import duckdb
-                    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA
 
-                    schema, folder = (TPCDS_SCHEMA, "tpc-ds") if suite_name == "tpcds" else (TPCH_SCHEMA, "tpc-h")
                     duck_conn = duckdb.connect()
-                    for table, columns in schema.items():
+                # Lazily materialize only referenced tables into memory once (~9x faster than CREATE VIEW).
+                for table in table_names:
+                    if table not in duck_loaded_tables and table in schema:
                         duck_conn.execute(
-                            f"CREATE VIEW {table} AS SELECT * FROM READ_CSV("
-                            f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={columns})"
+                            f"CREATE TABLE {table} AS SELECT * FROM READ_CSV("
+                            f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={schema[table]})"
                         )
+                        duck_loaded_tables.add(table)
                 new = duck_conn.execute(new_sql)
                 new_desc, new_rows = [d[:2] for d in new.description], new.fetchall()
                 old = duck_conn.execute(old_sql)
@@ -661,20 +681,20 @@ def verify_tpc_test(
 
         reexec_est_ms = 0
 
-        def _check_changed_query(index: int, sql: str, opt_expr=None) -> bool:
+        def _check_changed_query(index: int, sql: str, opt_expr=None, plan=None) -> bool:
             nonlocal reexec_count, reexec_cpu, reexec_est_ms
             reexec_count += 1
             q_est = q_cost_ms[index] if (q_cost_ms and index < len(q_cost_ms)) else 500
             if (
                 reexec_count > TPC_REEXEC_MAX_QUERIES
-                or (reexec_est_ms > 0 and reexec_est_ms + q_est > TPC_REEXEC_EST_BUDGET_MS)
+                or reexec_est_ms + q_est > TPC_REEXEC_EST_BUDGET_MS
                 or reexec_cpu > TPC_REEXEC_BUDGET_S
             ):
                 _why(f"{suite_name}: reexec limit ({reexec_count} queries, est={reexec_est_ms}ms, {reexec_cpu:.2f}s)")
                 return False
             reexec_est_ms += q_est
             t0 = time.process_time()
-            ok = same_rows_as_pinned(index, sql, opt_expr)
+            ok = same_rows_as_pinned(index, sql, opt_expr, plan=plan)
             reexec_cpu += time.process_time() - t0
             if not ok:
                 _why(f"{suite_name} q{index}: rows differ")
@@ -692,12 +712,13 @@ def verify_tpc_test(
                         if not skip_duck:
                             duck_sql = duck_gen.generate(parse_one(q["sql"]))
                             if duck_sql != q["duckdb_sql"]:
-                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"]):
+                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"], q["table_names"]):
                                     return False
                         if not skip_plan:
                             opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
-                            if plan_signature(Plan(opt_expr), serde_dump) != q["plan_sig"]:
-                                if not _check_changed_query(index, q["sql"], opt_expr):
+                            plan = Plan(opt_expr)
+                            if plan_signature(plan, serde_dump) != q["plan_sig"]:
+                                if not _check_changed_query(index, q["sql"], opt_expr, plan=plan):
                                     return False
                         continue
 
@@ -707,7 +728,7 @@ def verify_tpc_test(
                         if not skip_duck:
                             duck_sql = duck_gen.generate(parse_one(q["sql"]))
                             if duck_sql != q["duckdb_sql"]:
-                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"]):
+                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"], q["table_names"]):
                                     return False
                         raw_ckpt = pickle.loads(start_dumps_b[index]) if start_dumps_b is not None else start_dumps[index]
                         expr = serde_load(raw_ckpt)
@@ -741,13 +762,14 @@ def verify_tpc_test(
                                 leave_tables_isolated=True,
                                 copy=False,
                             )
-                        if serde_dump(opt_expr) != _q_opt_dump(q):
-                            if not _check_changed_query(index, q["sql"], opt_expr):
-                                return False
+                        if serde_dump(opt_expr) == _q_opt_dump(q) and plan_untouched:
                             continue
-                        if plan_untouched or plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]:
+                        plan = Plan(opt_expr)
+                        if plan_signature(plan, serde_dump) == q["plan_sig"]:
                             continue
-                        opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
+                        if not _check_changed_query(index, q["sql"], opt_expr, plan=plan):
+                            return False
+                        continue
                     else:
                         expr = parse_one(q["sql"])
                         if not q["execute"]:
@@ -758,7 +780,7 @@ def verify_tpc_test(
                         if not skip_duck:
                             duck_sql = duck_gen.generate(expr)
                             if duck_sql != q["duckdb_sql"]:
-                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"]):
+                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"], q["table_names"]):
                                     return False
                         if stop_k is not None and (stop_dumps_b is not None or stop_dumps is not None):
                             if stop_k == 0:
@@ -780,11 +802,12 @@ def verify_tpc_test(
                                 )
                         else:
                             opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
-                    if serde_dump(opt_expr) == _q_opt_dump(q) and (
-                        plan_untouched or plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]
-                    ):
+                    if serde_dump(opt_expr) == _q_opt_dump(q) and plan_untouched:
                         continue
-                    if not _check_changed_query(index, q["sql"], opt_expr):
+                    plan = Plan(opt_expr)
+                    if plan_signature(plan, serde_dump) == q["plan_sig"]:
+                        continue
+                    if not _check_changed_query(index, q["sql"], opt_expr, plan=plan):
                         return False
 
             _why(f"{suite_name}: pass ({reexec_count} reexec, {duck_count} duck changed)")
