@@ -58,6 +58,42 @@ def _decorator_name(node: ast.expr) -> str | None:
     return node.id if isinstance(node, ast.Name) else None
 
 
+def _is_safe_default_expr(node: ast.expr | None) -> bool:
+    """True if a default-argument expression is a pure literal/container that cannot fail or mutate at import."""
+    if node is None or isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Not, ast.Invert)):
+        return _is_safe_default_expr(node.operand)
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return all(_is_safe_default_expr(e) for e in node.elts)
+    if isinstance(node, ast.Dict):
+        return all(_is_safe_default_expr(k) and _is_safe_default_expr(v) for k, v in zip(node.keys, node.values))
+    return False
+
+
+def _has_safe_defaults(func_node: ast.AST) -> bool:
+    args = getattr(func_node, "args", None)
+    if args is None:
+        return False
+    return all(_is_safe_default_expr(d) for d in args.defaults) and all(
+        _is_safe_default_expr(d) for d in args.kw_defaults if d is not None
+    )
+
+
+def _has_no_annotations(func_node: ast.AST) -> bool:
+    if getattr(func_node, "returns", None) is not None:
+        return False
+    args = getattr(func_node, "args", None)
+    if args is None:
+        return True
+    all_args = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    if args.vararg is not None:
+        all_args.append(args.vararg)
+    if args.kwarg is not None:
+        all_args.append(args.kwarg)
+    return all(a.annotation is None for a in all_args)
+
+
 def _is_overload(node: ast.expr) -> bool:
     return (isinstance(node, ast.Name) and node.id == "overload") or (
         isinstance(node, ast.Attribute) and node.attr == "overload"
@@ -494,8 +530,9 @@ class Selector:
                 log(f"value map error on {path}: {type(error).__name__}: {error}")
                 vmask = None
             if vmask is not None:
-                log(f"{path}: value map narrows {bin(mask).count('1')} -> {bin(vmask).count('1')} tests")
-                mask = vmask
+                # Both are sound supersets of what the edit reaches: keep their intersection.
+                log(f"{path}: value map narrows {bin(mask).count('1')} -> {bin(mask & vmask).count('1')} tests")
+                mask &= vmask
                 self._owner_checks = owners_before
                 self._coarse_block = False
 
@@ -556,7 +593,7 @@ class Selector:
         self._spans_ok = False
         mask = 0
         for lineno, _ in removed:
-            mask |= self.old_line(path, module, old_scopes, lineno)
+            mask |= self.old_line(path, module, old_scopes, new_scopes, lineno)
         for new_lineno, anchor, _ in added:
             mask |= self.new_line(path, module, old_scopes, new_scopes, new_lineno, anchor)
         return mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
@@ -962,13 +999,30 @@ class Selector:
                 )
         return self._module_reach(path)
 
-    def old_line(self, path, module, scopes, lineno) -> int:
+    def _safe_sig_edit(self, old_scopes: Scopes, new_scopes: Scopes, qualname: str) -> bool:
+        """True when an existing function's header edit kept identical decorators and safe literal defaults."""
+        old_rt = _runtime_def(old_scopes, qualname)
+        new_rt = _runtime_def(new_scopes, qualname)
+        if old_rt is None or new_rt is None:
+            return False
+        old_node, new_node = old_rt[4], new_rt[4]
+        if [ast.dump(d) for d in old_node.decorator_list] != [ast.dump(d) for d in new_node.decorator_list]:
+            return False
+        if not (_has_safe_defaults(old_node) and _has_safe_defaults(new_node)):
+            return False
+        if not (old_scopes.has_future_annotations and new_scopes.has_future_annotations):
+            if not (_has_no_annotations(old_node) and _has_no_annotations(new_node)):
+                return False
+        return True
+
+    def old_line(self, path, module, scopes, new_scopes, lineno) -> int:
         function = scopes.function_at(lineno)
         if function is not None:
             body_start, end, head, qualname, node = function
             mask = self.function_level(path, module, body_start, end)
             if lineno < body_start:  # signature or decorator: callers and overriding both change
-                mask |= self.container_level(path, module, scopes, head)
+                if not self._safe_sig_edit(scopes, new_scopes, qualname):
+                    mask |= self.container_level(path, module, scopes, head)
             if lineno in scopes.docstrings:
                 mask |= self.docs_mask
             return mask
@@ -988,13 +1042,26 @@ class Selector:
         if function is not None:
             body_start, end, head, qualname, node = function
             spans = old_scopes.by_qualname.get(qualname)
-            if spans and new_lineno >= body_start:
+            if spans and (new_lineno >= body_start or self._safe_sig_edit(old_scopes, new_scopes, qualname)):
                 mask = 0
                 for start, stop in spans:
                     mask |= self.function_level(path, module, start, stop)
                 if new_lineno in new_scopes.docstrings:
                     mask |= self.docs_mask
                 return mask
+            # Newly added private helper function/method whose name never existed in pinned code
+            # can only be reached via call sites added in the same patch (already covered in mask).
+            if (
+                not spans
+                and self.impact.pinned_identifiers
+                and node.name not in self.impact.pinned_identifiers
+                and not node.name.endswith("_sql")
+                and not (node.name.startswith("__") and node.name.endswith("__"))
+                and all(_decorator_name(d) in SAFE_HOTPATCH_DECORATORS for d in node.decorator_list)
+                and _has_safe_defaults(node)
+                and (new_scopes.has_future_annotations or _has_no_annotations(node))
+            ):
+                return self.docs_mask if new_lineno in new_scopes.docstrings else 0
             # new function or changed signature: what defines it changed
             mask = self.container_level(path, module, new_scopes, head)
             for start, stop in spans or []:

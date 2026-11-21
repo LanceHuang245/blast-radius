@@ -313,6 +313,15 @@ def main() -> None:
 
     old_masks = [int(s, 16) for s in raw["sets"]]
     trees = _parse_trees(SOURCE)
+    pinned_ids: set[str] = set()
+    for tree in trees.values():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                pinned_ids.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                pinned_ids.add(node.attr)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                pinned_ids.add(node.name)
     scoped_refs = _scoped_class_refs(trees, raw["lines"], old_masks)
     typing_dialects = _typing_dialect_map(SOURCE, trees)
 
@@ -323,6 +332,7 @@ def main() -> None:
     raw["import_any_attrs"] = [a for a in raw.get("import_any_attrs", []) if a != "EXPRESSION_METADATA"]
     raw["import_value_attrs"] = [a for a in raw.get("import_value_attrs", []) if a != "EXPRESSION_METADATA"]
     raw["typing_dialects"] = typing_dialects
+    raw["pinned_identifiers"] = sorted(pinned_ids)
     cal = _calibrate_and_update_tpc_meta(SOURCE, raw["tests"])
     cal["tests/test_generator.py::TestGenerator::test_generator_memory"] = 18400
     cal["tests/dialects/test_dialect.py::TestDialect::test_lazy_load"] = 5

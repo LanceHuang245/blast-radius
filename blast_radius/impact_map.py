@@ -40,6 +40,7 @@ class ImpactMap:
         self.importers: dict[str, list[str]] = raw["importers"]
         self.lazy_importers: dict[str, list[list]] = raw.get("lazy_importers", {})
         self.typing_dialects: dict[str, list[str]] = raw.get("typing_dialects", {})
+        self.pinned_identifiers: set[str] = set(raw.get("pinned_identifiers", []))
         self.real_cpu_ms: dict[str, int] = raw.get("real_cpu_ms", {})
         self.everything = (1 << len(self.test_ids)) - 1
 

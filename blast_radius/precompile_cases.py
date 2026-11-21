@@ -30,17 +30,27 @@ from collections import defaultdict
 from contextlib import contextmanager
 
 from blast_radius import APP, SOURCE
-from blast_radius.precompile_tpc import TPC_STAGE1_FILE, plan_signature
+from blast_radius.precompile_tpc import TPC_STAGE1_FILE, TPC_STAGE2_FILE, plan_signature
 
 CASES_FILE = APP / "map" / "cases.marshal"
 TPCDS_CKPTS_META_FILE = APP / "map" / "tpcds_ckpts_meta.pkl"
+TPC_S1_BLOBS_FILE = APP / "map" / "tpc_s1_blobs.pkl"
+TPC_S2_BLOBS_DIR = APP / "map" / "tpc_s2_blobs"
 TPCDS_CKPT_DIR = APP / "map"
 OPT_TEST_FILE = "tests/test_optimizer.py"
-TPCDS_CKPT_STAGES = (1, 3, 5, 8, 12, 14)
+TPCDS_CKPT_STAGES = (0, 1, 3, 5, 7, 8, 12, 14)
 
 
 def tpcds_ckpt_stage_file(stage: int):
     return TPCDS_CKPT_DIR / f"tpcds_ckpt_{stage}.pkl"
+
+
+def tpc_s2_table_file(suite: str, table_name: str):
+    return TPC_S2_BLOBS_DIR / suite / f"t_{table_name}.pkl"
+
+
+def tpc_s2_query_file(suite: str, index: int):
+    return TPC_S2_BLOBS_DIR / suite / f"q_{index}.pkl"
 
 
 class _SubTestFilterTransformer(ast.NodeTransformer):
@@ -474,10 +484,126 @@ def _record_validator_cases(mon, tool: int, src_prefix: str) -> dict[str, dict]:
     return per_test
 
 
+def _record_extra_subtest_cases(mon, tool: int, src_prefix: str) -> dict[str, dict]:
+    """Record bucketed subTest coverage for heavy non-optimizer tests (test_identity, test_cache_does_not_retain_queries)."""
+    import sqlglot.generator as generator
+
+    targets = (
+        ("tests/test_transpile.py", "TestTranspile", "test_identity"),
+        ("tests/test_schema.py", "TestSchema", "test_cache_does_not_retain_queries"),
+    )
+    prefix_cut = len(src_prefix) - len("sqlglot/")
+    state = {"active": False, "mode": None, "depth": 0, "sub_idx": 0, "stride": 1, "cur_bucket": -1}
+    current_lines: set[tuple[str, int]] = set()
+    lines_ref: list[dict[str, dict[int, int]]] = [{}]
+
+    def on_line(code, line):
+        if state["active"] and code.co_filename.startswith(src_prefix):
+            current_lines.add((code.co_filename[prefix_cut:], line))
+        return mon.DISABLE
+
+    mon.register_callback(tool, mon.events.LINE, on_line)
+    orig_subtest = unittest.TestCase.subTest
+
+    def flush() -> None:
+        b = state["cur_bucket"]
+        if b >= 0:
+            mon.set_events(tool, 0)
+            bit = 1 << b
+            cur_map = lines_ref[0]
+            for rel, ln in current_lines:
+                cur_map[rel][ln] = cur_map[rel].get(ln, 0) | bit
+            state["cur_bucket"] = -1
+            state["active"] = False
+
+    @contextmanager
+    def recording_subtest(self, msg=unittest.case._subtest_msg_sentinel, **params):
+        if state["depth"] == 0:
+            if state["mode"] == "count":
+                state["sub_idx"] += 1
+            elif state["mode"] == "subtest":
+                idx = state["sub_idx"]
+                state["sub_idx"] = idx + 1
+                bucket = idx // state["stride"]
+                if bucket != state["cur_bucket"]:
+                    flush()
+                    generator._DISPATCH_CACHE.clear()
+                    current_lines.clear()
+                    state["cur_bucket"] = bucket
+                    state["active"] = True
+                    mon.restart_events()
+                    mon.set_events(tool, mon.events.LINE)
+        state["depth"] += 1
+        try:
+            with orig_subtest(self, msg, **params):
+                yield
+        finally:
+            state["depth"] -= 1
+
+    verify_state = {"mask": None, "idx": 0, "stride": 1}
+
+    def _verify_ok() -> bool:
+        idx = verify_state["idx"]
+        verify_state["idx"] = idx + 1
+        mask = verify_state["mask"]
+        return mask is None or bool(mask >> (idx // verify_state["stride"]) & 1)
+
+    per_test: dict[str, dict] = {}
+    unittest.TestCase.subTest = recording_subtest
+    try:
+        for rel_file, cls_name, meth in targets:
+            mod = importlib.import_module(rel_file[:-3].replace("/", "."))
+            cls = getattr(mod, cls_name)
+            state.update(active=False, mode="count", depth=0, sub_idx=0, stride=1, cur_bucket=-1)
+            r0 = unittest.TestResult()
+            cls(meth).run(r0)
+            total_sub = state["sub_idx"]
+            if not r0.wasSuccessful() or total_sub < 2:
+                continue
+            stride = max(1, (total_sub + 31) // 32)
+            n_buckets = (total_sub + stride - 1) // stride
+            cur_lines: dict[str, dict[int, int]] = defaultdict(dict)
+            lines_ref[0] = cur_lines
+            state.update(active=False, mode="subtest", depth=0, sub_idx=0, stride=stride, cur_bucket=-1)
+            r1 = unittest.TestResult()
+            cls(meth).run(r1)
+            flush()
+            if not r1.wasSuccessful() or state["sub_idx"] != total_sub:
+                continue
+            unittest.TestCase.subTest = orig_subtest
+            try:
+                if not transform_subtest_method(mod, cls, meth, _verify_ok):
+                    continue
+                ok_both = True
+                for b_probe in (0, n_buckets - 1):
+                    verify_state.update(mask=1 << b_probe, idx=0, stride=stride)
+                    r2 = unittest.TestResult()
+                    cls(meth).run(r2)
+                    if not r2.wasSuccessful() or verify_state["idx"] != total_sub:
+                        ok_both = False
+                        break
+                if ok_both:
+                    tid = f"{rel_file}::{cls_name}::{meth}"
+                    per_test[tid] = {
+                        "kind": "subtest",
+                        "count": n_buckets,
+                        "stride": stride,
+                        "lines": dict(cur_lines),
+                    }
+            finally:
+                verify_state["mask"] = None
+                unittest.TestCase.subTest = recording_subtest
+    finally:
+        mon.set_events(tool, 0)
+        unittest.TestCase.subTest = orig_subtest
+    return per_test
+
+
 def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, dict], dict]:
-    """Record per-query TPC Stage-1 coverage and TPC-DS intermediate rule checkpoints."""
+    """Record per-query TPC Stage-1 & Stage-2b coverage, fast per-query/table blobs, and TPC-DS checkpoints."""
     from sqlglot import Dialect, find_tables, parse_one
-    from sqlglot.executor.python import Python
+    from sqlglot.executor.python import Python, PythonExecutor
+    from sqlglot.executor.table import Table, ensure_tables
     from sqlglot.optimizer import optimize
     from sqlglot.optimizer.optimizer import RULES
     from sqlglot.planner import Plan
@@ -488,6 +614,7 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
 
     per_tpc: dict[str, dict] = {}
     s1_all = pickle.load(open(TPC_STAGE1_FILE, "rb")) if TPC_STAGE1_FILE.is_file() else {}
+    s2_all = pickle.load(open(TPC_STAGE2_FILE, "rb")) if TPC_STAGE2_FILE.is_file() else {}
     cur_lines: set[tuple[str, int]] = set()
     recording = [False]
     prefix_cut = len(src_prefix) - len("sqlglot/")
@@ -501,6 +628,9 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
     duck_gen = Dialect.get_or_raise("duckdb").generator()
     py_gen = Python().generator(identify=True, comments=False)
 
+    # Convert monolithic tpc_stage1.pkl & tpc_stage2.pkl into lazy per-query / per-table blobs
+    # so children load in ~2-5ms instead of unpickling 33MB (~1.2s).
+    s1_blobs: dict[str, dict] = {}
     for suite, tid in (
         ("tpcds", "tests/test_executor.py::TestExecutor::test_execute_tpcds"),
         ("tpch", "tests/test_executor.py::TestExecutor::test_execute_tpch"),
@@ -541,118 +671,256 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
         for rel, ln in sorted(cur_lines):
             s2a_lines[rel].append(ln)
 
+        # Record per-query Stage-2b coverage (PythonExecutor.execute) and write per-table/query blobs.
+        # Use local LINE events on stage2b_files code objects only so dynamically eval'd <string>
+        # SQL expressions run at full native speed during Docker build.
+        s2b_lines: dict[str, dict[int, int]] = defaultdict(dict)
+        s2 = s2_all.get(suite)
+        if s2:
+            suite_dir = TPC_S2_BLOBS_DIR / suite
+            suite_dir.mkdir(parents=True, exist_ok=True)
+            with open(suite_dir / "meta.pkl", "wb") as handle:
+                pickle.dump(
+                    {
+                        "schema": s2["schema"],
+                        "n_queries": len(s2["queries"]),
+                        "exec_tables": [q.get("table_names", []) if q["execute"] else [] for q in s2["queries"]],
+                    },
+                    handle,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                )
+            for tname, rows in s2["tables_raw"].items():
+                with open(tpc_s2_table_file(suite, tname), "wb") as handle:
+                    pickle.dump(rows, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            tables_by_name = {
+                name: Table(columns=s2["schema"][name], rows=list(rows))
+                for name, rows in s2["tables_raw"].items()
+            }
+            # Collect code objects from sqlglot/executor/* (the Stage-2b runtime modules).
+            s2b_codes: list = []
+            seen_codes: set[int] = set()
+
+            def _collect_codes(co) -> None:
+                if id(co) in seen_codes:
+                    return
+                seen_codes.add(id(co))
+                if getattr(co, "co_filename", "").startswith(src_prefix + "executor/"):
+                    s2b_codes.append(co)
+                for const in getattr(co, "co_consts", ()):
+                    if hasattr(const, "co_code"):
+                        _collect_codes(const)
+
+            import types as _types
+
+            for mod_name, mod_obj in list(sys.modules.items()):
+                if mod_name.startswith("sqlglot.executor") and isinstance(mod_obj, _types.ModuleType):
+                    for obj in vars(mod_obj).values():
+                        if hasattr(obj, "__code__"):
+                            _collect_codes(obj.__code__)
+                        elif isinstance(obj, type):
+                            for attr in vars(obj).values():
+                                fn = getattr(attr, "__func__", attr)
+                                if hasattr(fn, "__code__"):
+                                    _collect_codes(fn.__code__)
+
+            for idx, q in enumerate(s2["queries"]):
+                with open(tpc_s2_query_file(suite, idx), "wb") as handle:
+                    pickle.dump(q, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                if not q["execute"]:
+                    continue
+                opt_expr = serde_load(q["opt_dump"])
+                plan = Plan(opt_expr)
+                q_tables = {name: tables_by_name[name] for name in q["table_names"]}
+                cur_lines.clear()
+                recording[0] = True
+                mon.restart_events()
+                for co in s2b_codes:
+                    mon.set_local_events(tool, co, mon.events.LINE)
+                tables_ = ensure_tables(q_tables)
+                PythonExecutor(tables=tables_).execute(plan)
+                for co in s2b_codes:
+                    mon.set_local_events(tool, co, 0)
+                recording[0] = False
+                bit = 1 << idx
+                for rel, ln in cur_lines:
+                    s2b_lines[rel][ln] = s2b_lines[rel].get(ln, 0) | bit
+
+        # Store Stage-1 per-query opt_dump & gen_pairs as lazy bytes blobs.
+        q_blobs = []
+        for q in s1["queries"]:
+            qb = dict(q)
+            if "opt_dump" in qb:
+                qb["opt_dump_b"] = pickle.dumps(qb.pop("opt_dump"), protocol=4)
+            q_blobs.append(qb)
+        s1_blobs[suite] = {
+            "name": s1["name"],
+            "schema": s1["schema"],
+            "queries": q_blobs,
+            "gen_pairs_b": pickle.dumps(s1["gen_pairs"], protocol=4),
+        }
+
         per_tpc[tid] = {
             "kind": "tpc_stage1",
             "count": len(s1["queries"]),
             "lines": dict(q_lines),
             "s2a_lines": dict(s2a_lines),
+            "s2b_lines": dict(s2b_lines),
         }
+
+    with open(TPC_S1_BLOBS_FILE, "wb") as handle:
+        pickle.dump(s1_blobs, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
     mon.set_events(tool, 0)
 
-    # Build TPC-DS rule checkpoints (Rules 1, 3, 5, 8, 12, 14) with exact sys.setprofile file sets.
+    # Build TPC-DS rule checkpoints (Stages 0, 1, 3, 5, 7, 8, 12, 14) with both file-level sets
+    # and exact per-line stage bitmasks via sys.monitoring (mon.DISABLE -> fast & accurate timing).
     pairs = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
     sqls = [sql for _, sql, _ in pairs]
     expected = [exp_sql for _, _, exp_sql in pairs]
-    schema = ensure_schema(TPCDS_SCHEMA)
     kw = {
         "db": None,
         "catalog": None,
-        "schema": schema,
+        "schema": None,
         "dialect": None,
         "sql": None,
         "isolate_tables": True,
         "quote_identifiers": False,
     }
-    full_prefix = str(SOURCE.resolve()) + "/"
-    stage_files: set[str] = set()
+    stage_lines: dict[str, dict[int, int]] = defaultdict(dict)
 
-    def prof(frame, event, _arg):
-        if event == "call":
-            fn = frame.f_code.co_filename
-            if fn.startswith(full_prefix):
-                rel = fn[len(full_prefix) :]
-                if rel.startswith("sqlglot/"):
-                    stage_files.add(rel)
-        return None
+    def _run_stage(bit_idx: int, fn) -> tuple[object, set[str], float]:
+        generator._DISPATCH_CACHE.clear()
+        cur_lines.clear()
+        recording[0] = True
+        mon.restart_events()
+        mon.set_events(tool, mon.events.LINE)
+        t_s = time.process_time()
+        val = fn()
+        dt_ms = (time.process_time() - t_s) * 1000.0
+        mon.set_events(tool, 0)
+        recording[0] = False
+        bit = 1 << bit_idx
+        files: set[str] = set()
+        for rel, ln in cur_lines:
+            stage_lines[rel][ln] = stage_lines[rel].get(ln, 0) | bit
+            files.add(rel)
+        return val, files, dt_ms
 
-    cum_files: set[str] = {
+    base_opt_files: set[str] = {
         "sqlglot/optimizer/optimizer.py",
         "sqlglot/schema.py",
         "sqlglot/serde.py",
     }
+    cum_files = set(base_opt_files)
     rule_times_ms: list[float] = []
+    rule_files: list[set[str]] = []
     ckpt_data: dict[int, dict] = {}
-    sys.setprofile(prof)
-    try:
-        stage_files.clear()
-        exprs = [parse_one(sql) for sql in sqls]
-        cum_files |= stage_files
-        parse_files = set(stage_files) | {"sqlglot/serde.py"}
 
-        for idx, rule in enumerate(RULES):
-            if idx in TPCDS_CKPT_STAGES:
-                sys.setprofile(None)
-                ckpt_data[idx] = {
-                    "files": sorted(cum_files),
-                    "dumps": [serde_dump(e) for e in exprs],
-                }
-                sys.setprofile(prof)
-            stage_files.clear()
-            t0 = time.process_time()
-            params = inspect.getfullargspec(rule).args
-            rkw = {p: kw[p] for p in params if p in kw}
-            exprs = [rule(e, **rkw) for e in exprs]
-            rule_times_ms.append((time.process_time() - t0) * 1000)
-            cum_files |= stage_files
+    # Bit 21: ensure_schema (blocks skipping when schema construction lines are edited).
+    schema, schema_files, _ = _run_stage(21, lambda: ensure_schema(TPCDS_SCHEMA))
+    kw["schema"] = schema
+    cum_files |= schema_files
 
-        sys.setprofile(None)
-        ckpt_data[14] = {
-            "files": sorted(cum_files),
-            "dumps": [serde_dump(e) for e in exprs],
-        }
-        t0 = time.process_time()
-        for e in exprs:
-            e.sql(pretty=True)
-        sql_ms = (time.process_time() - t0) * 1000
+    # Bit 0: parse_one(sql) for all 99 queries.
+    # Freeze dumps to bytes immediately so later rules mutating expr.meta in-place cannot alter checkpoints!
+    exprs, p_files, _ = _run_stage(0, lambda: [parse_one(sql) for sql in sqls])
+    cum_files |= p_files
+    parse_files = set(p_files) | schema_files | {"sqlglot/serde.py"}
+    ckpt_data[0] = {
+        "files": sorted(cum_files),
+        "dumps_b": [pickle.dumps(serde_dump(e), protocol=4) for e in exprs],
+    }
 
-        s1_tpcds = s1_all.get("tpcds")
-        s1_duck_files: set[str] = set()
-        s1_plan_files: set[str] = set()
-        s1_pygen_files: set[str] = set()
-        if s1_tpcds:
-            sys.setprofile(prof)
-            stage_files.clear()
-            for q in s1_tpcds["queries"]:
-                if q["execute"]:
-                    duck_gen.generate(parse_one(q["sql"]))
-            s1_duck_files = set(stage_files)
+    # Bits 1..14: RULES[0..13].
+    for idx, rule in enumerate(RULES):
+        if idx in TPCDS_CKPT_STAGES and idx not in ckpt_data:
+            ckpt_data[idx] = {
+                "files": sorted(cum_files),
+                "dumps_b": [pickle.dumps(serde_dump(e), protocol=4) for e in exprs],
+            }
+        params = inspect.getfullargspec(rule).args
+        if idx < 7:
+            assert "leave_tables_isolated" not in params
+        rkw = {p: kw[p] for p in params if p in kw}
+        exprs, r_files, r_ms = _run_stage(idx + 1, lambda r=rule, rk=rkw, es=exprs: [r(e, **rk) for e in es])
+        rule_times_ms.append(r_ms)
+        rule_files.append(r_files | base_opt_files | schema_files)
+        cum_files |= r_files
 
-            stage_files.clear()
-            for q in s1_tpcds["queries"]:
-                if q["execute"]:
-                    Plan(serde_load(q["opt_dump"]))
-            s1_plan_files = set(stage_files)
+    ckpt_data[14] = {
+        "files": sorted(cum_files),
+        "dumps_b": [pickle.dumps(serde_dump(e), protocol=4) for e in exprs],
+    }
 
-            stage_files.clear()
-            for expr_dump, _ in s1_tpcds["gen_pairs"]:
-                py_gen.generate(serde_load(expr_dump))
-            s1_pygen_files = set(stage_files)
-            sys.setprofile(None)
-    finally:
-        sys.setprofile(None)
+    # Bit 17: e.sql(pretty=True) for verify_opt_tpcds.
+    _, g_files, sql_ms = _run_stage(17, lambda: [e.sql(pretty=True) for e in exprs])
+    gen_files = g_files | {"sqlglot/serde.py"}
+
+    # Bit 15: RULES[7:] with leave_tables_isolated=True (test_execute_tpcds).
+    exec_tail_files: set[str] = set()
+    if 7 in ckpt_data:
+        exec_exprs = [serde_load(pickle.loads(db)) for db in ckpt_data[7]["dumps_b"]]
+        exec_kw = {**kw, "leave_tables_isolated": True}
+
+        def _run_exec_tail():
+            cur = exec_exprs
+            for rule in RULES[7:]:
+                params = inspect.getfullargspec(rule).args
+                rkw = {p: exec_kw[p] for p in params if p in exec_kw}
+                cur = [rule(e, **rkw) for e in cur]
+            return cur
+
+        _, et_files, _ = _run_stage(15, _run_exec_tail)
+        exec_tail_files = et_files | base_opt_files | schema_files
+
+    s1_tpcds = s1_all.get("tpcds")
+    s1_duck_files: set[str] = set()
+    s1_plan_files: set[str] = set()
+    s1_pygen_files: set[str] = set()
+    if s1_tpcds:
+        # Bit 18: duck_gen.generate(parse_one(sql)).
+        _, s1_duck_files, _ = _run_stage(
+            18,
+            lambda: [duck_gen.generate(parse_one(q["sql"])) for q in s1_tpcds["queries"] if q["execute"]],
+        )
+        # Bit 16: Plan(opt_expr).
+        _, s1_plan_files, _ = _run_stage(
+            16,
+            lambda: [Plan(serde_load(q["opt_dump"])) for q in s1_tpcds["queries"] if q["execute"]],
+        )
+        # Bit 19: py_gen.generate(expr).
+        _, s1_pygen_files, _ = _run_stage(
+            19,
+            lambda: [py_gen.generate(serde_load(expr_dump)) for expr_dump, _ in s1_tpcds["gen_pairs"]],
+        )
+        # Bit 20: find_tables(expr).
+        parsed_exec = [
+            serde_load(pickle.loads(ckpt_data[0]["dumps_b"][i]))
+            for i, q in enumerate(s1_tpcds["queries"])
+            if q["execute"]
+        ]
+        _run_stage(20, lambda: [{t.name for t in find_tables(e)} for e in parsed_exec])
 
     for k, entry in ckpt_data.items():
-        rem_ms = (sum(rule_times_ms[k:]) * 0.55) + sql_ms + 40.0
+        rem_ms = (sum(rule_times_ms[k:]) * 0.85) + sql_ms + 40.0
         entry["est_ms"] = max(80, round(rem_ms))
+        suffix_opt: set[str] = set()
+        for rf in rule_files[k:]:
+            suffix_opt |= rf
+        entry["suffix_files"] = sorted(suffix_opt)
+        entry["suffix_exec_files"] = sorted(suffix_opt | exec_tail_files) if k <= 7 else sorted(suffix_opt)
 
     ckpts_payload = {
         "sqls": sqls,
         "expected": expected,
         "schema": TPCDS_SCHEMA,
         "checkpoints": ckpt_data,
+        "stage_lines": dict(stage_lines),
+        "rule_times_ms": [round(x, 1) for x in rule_times_ms],
+        "sql_ms": round(sql_ms, 1),
+        "gen_files": sorted(gen_files),
         "parse_files": sorted(parse_files),
-        "s1_opt_files": sorted(cum_files),
+        "s1_opt_files": sorted(cum_files | exec_tail_files),
         "s1_duck_files": sorted(s1_duck_files | {"sqlglot/serde.py"}),
         "s1_plan_files": sorted(s1_plan_files | {"sqlglot/serde.py"}),
         "s1_pygen_files": sorted(s1_pygen_files | {"sqlglot/serde.py"}),
@@ -661,6 +929,8 @@ def _record_tpc_and_ckpts(mon, tool: int, src_prefix: str) -> tuple[dict[str, di
 
 
 def main() -> None:
+    import gc
+
     t0 = time.perf_counter()
     os.chdir(SOURCE)
     sys.path.insert(0, str(SOURCE))
@@ -672,41 +942,90 @@ def main() -> None:
     V._patch_pool_references()
     src_prefix = str(SOURCE.resolve()) + "/sqlglot/"
 
+    # Run the 3 independent build-time recorders in parallel via fork() for ~2.5-3x faster builds.
+    gc.freeze()
+    opt_tmp = "/tmp/_br_pc_opt.marshal"
+    val_tmp = "/tmp/_br_pc_val.marshal"
+
+    def _spawn_recorder(tmp_path: str, fn) -> int:
+        pid = os.fork()
+        if pid == 0:
+            mon = sys.monitoring
+            tool = mon.COVERAGE_ID
+            mon.use_tool_id(tool, "blast_radius_cases")
+            try:
+                data = fn(mon, tool)
+                with open(tmp_path, "wb") as handle:
+                    handle.write(marshal.dumps(data))
+            finally:
+                mon.set_events(tool, 0)
+                mon.free_tool_id(tool)
+            os._exit(0)
+        return pid
+
+    pid_opt = _spawn_recorder(
+        opt_tmp,
+        lambda mon, tool: {
+            **_record_optimizer_cases(mon, tool, src_prefix),
+            **_record_extra_subtest_cases(mon, tool, src_prefix),
+        },
+    )
+    pid_val = _spawn_recorder(val_tmp, lambda mon, tool: _record_validator_cases(mon, tool, src_prefix))
+
     mon = sys.monitoring
     tool = mon.COVERAGE_ID
     mon.use_tool_id(tool, "blast_radius_cases")
     try:
-        opt_cases = _record_optimizer_cases(mon, tool, src_prefix)
-        val_cases = _record_validator_cases(mon, tool, src_prefix)
         tpc_cases, ckpts_payload = _record_tpc_and_ckpts(mon, tool, src_prefix)
     finally:
         mon.set_events(tool, 0)
         mon.free_tool_id(tool)
 
+    _, st_opt = os.waitpid(pid_opt, 0)
+    _, st_val = os.waitpid(pid_val, 0)
+    if st_opt != 0 or st_val != 0:
+        raise RuntimeError(f"precompile_cases child failed: opt={st_opt} val={st_val}")
+
+    opt_cases = marshal.loads(open(opt_tmp, "rb").read())
+    val_cases = marshal.loads(open(val_tmp, "rb").read())
+    for p in (opt_tmp, val_tmp):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
     all_cases = {**opt_cases, **val_cases, **tpc_cases}
     CASES_FILE.write_bytes(marshal.dumps(all_cases))
 
-    # Write tiny metadata file (~5KB) for parent planning and per-stage dump files (~6MB each)
-    # loaded lazily inside forked children only for the exact checkpoint stage used.
+    # Write tiny metadata file (~6KB) for parent planning and per-stage dump files where each
+    # query dump is an individual bytes blob so loading a few queries takes ~2ms instead of 1.1s.
     ckpt_meta = {}
     ckpt_bytes = 0
     for k, entry in ckpts_payload["checkpoints"].items():
         stage_file = tpcds_ckpt_stage_file(k)
+        payload = {
+            "dumps_b": entry["dumps_b"],
+            "expected": ckpts_payload["expected"],
+            "schema": ckpts_payload["schema"],
+        }
+        if k == 0:
+            payload["sqls"] = ckpts_payload["sqls"]
         with open(stage_file, "wb") as handle:
-            pickle.dump(
-                {
-                    "dumps": entry["dumps"],
-                    "expected": ckpts_payload["expected"],
-                    "schema": ckpts_payload["schema"],
-                },
-                handle,
-                protocol=pickle.HIGHEST_PROTOCOL,
-            )
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
         ckpt_bytes += stage_file.stat().st_size
-        ckpt_meta[k] = {"files": entry["files"], "est_ms": entry["est_ms"]}
+        ckpt_meta[k] = {
+            "files": entry["files"],
+            "suffix_files": entry["suffix_files"],
+            "suffix_exec_files": entry["suffix_exec_files"],
+            "est_ms": entry["est_ms"],
+        }
 
     meta_payload = {
         "checkpoints": ckpt_meta,
+        "stage_lines": ckpts_payload["stage_lines"],
+        "rule_times_ms": ckpts_payload["rule_times_ms"],
+        "sql_ms": ckpts_payload["sql_ms"],
+        "gen_files": ckpts_payload["gen_files"],
         "parse_files": ckpts_payload["parse_files"],
         "s1_opt_files": ckpts_payload["s1_opt_files"],
         "s1_duck_files": ckpts_payload["s1_duck_files"],

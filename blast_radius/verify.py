@@ -44,8 +44,10 @@ from blast_radius.tpc_verify import (
     TPC_EST_CPU_MS,
     TPC_SUITE_BY_TEST_ID,
     est_tpc_fast_a_ms,
+    est_tpc_mode_ms,
     select_tpc_mode,
     select_tpcds_ckpt,
+    select_tpcds_span,
     verify_generator_memory,
     verify_lazy_athena_presto,
     verify_max_nodes,
@@ -59,8 +61,9 @@ MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "6000"))
 MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "6000"))
 MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "350"))
 MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "600"))
+MIN_ROI_RATIO = float(os.environ.get("BR_MIN_ROI_RATIO", "1.45"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
-TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "95000"))
+TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "38000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
@@ -131,6 +134,7 @@ class VerifyTask:
     subtest_filter: dict[int, tuple[int, int]] = field(default_factory=dict)
     validator_filter: dict[int, tuple[int, int]] = field(default_factory=dict)
     tpc_query_mask: dict[int, int] = field(default_factory=dict)
+    tpc_s2b_query_mask: dict[int, int] = field(default_factory=dict)
     cpu_override: dict[int, int] = field(default_factory=dict)
 
 
@@ -426,6 +430,41 @@ def _install_lazy_executor_setup(cls: type) -> None:
         setattr(cls, attr_name, _LazyAttr(attr_name))
 
 
+def _install_lazy_optimizer_setup(cls: type) -> None:
+    """Defer TestOptimizer's DuckDB table creation until a test actually accesses self.conn."""
+    if getattr(cls, "_br_lazy_opt_setup", False):
+        return
+    orig_cm = cls.__dict__.get("setUpClass")
+    if not isinstance(orig_cm, classmethod):
+        return
+    cls._br_lazy_opt_setup = True
+    real_setup = orig_cm.__func__
+    conn_initialized = [False]
+
+    def ensure_conn() -> None:
+        if conn_initialized[0]:
+            return
+        conn_initialized[0] = True
+        if "conn" in cls.__dict__:
+            delattr(cls, "conn")
+        real_setup(cls)
+
+    class _LazyConn:
+        def __get__(self, obj, objtype=None):
+            ensure_conn()
+            return getattr(cls, "conn")
+
+    def light_setup(c) -> None:
+        import sqlglot
+        from sqlglot.schema import MappingSchema
+
+        c.pool = _InProcessExecutor()
+        sqlglot.schema = MappingSchema()
+
+    cls.setUpClass = classmethod(light_setup)
+    setattr(cls, "conn", _LazyConn())
+
+
 def _install_lazy_data_libs() -> None:
     """Defer importing numpy and pandas until actually accessed by a test.
 
@@ -624,9 +663,10 @@ def _est_test_cpu_ms(
     tpc_mode: str | None,
     cpu_by_number: dict[int, int],
     tpc_query_mask: dict[int, int] | None = None,
+    tpc_s2b_query_mask: dict[int, int] | None = None,
 ) -> int:
     """Return the CPU estimate (ms) for verifying test `num` on `sel`, safety factor included."""
-    special = _special_cpu_ms(num, tid, sel, tpc_mode, tpc_query_mask)
+    special = _special_cpu_ms(num, tid, sel, tpc_mode, tpc_query_mask, tpc_s2b_query_mask)
     # cpu_by_number already carries BR_CPU_SCALE (applied in __main__); dedicated verifiers'
     # estimates are measured end to end and use their own factor.
     return cpu_by_number[num] if special is None else round(special * SPECIAL_CPU_SCALE)
@@ -638,22 +678,25 @@ def _special_cpu_ms(
     sel: Selection,
     tpc_mode: str | None,
     tpc_query_mask: dict[int, int] | None,
+    tpc_s2b_query_mask: dict[int, int] | None = None,
 ) -> int | None:
     """Raw CPU estimate for tests with a dedicated fast verifier, else None."""
     if tid == LAZY_LOAD_TEST_ID and "tests/dialects/test_dialect.py" not in sel.patched_files:
         return 5
     if tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
         suite = TPC_SUITE_BY_TEST_ID[tid]
-        if tpc_mode == "fast_a":
-            q_mask = tpc_query_mask.get(num) if tpc_query_mask is not None else None
-            total_q = 99 if suite == "tpcds" else 22
-            return est_tpc_fast_a_ms(
-                suite,
-                sel.patched_files,
-                q_mask.bit_count() if q_mask is not None else None,
-                total_q,
-            )
-        return TPC_EST_CPU_MS[(suite, tpc_mode)]
+        q_mask = tpc_query_mask.get(num) if tpc_query_mask is not None else None
+        s2b_mask = tpc_s2b_query_mask.get(num) if tpc_s2b_query_mask is not None else None
+        total_q = 99 if suite == "tpcds" else 22
+        return est_tpc_mode_ms(
+            suite,
+            tpc_mode,
+            sel.patched_files,
+            q_mask.bit_count() if q_mask is not None else None,
+            s2b_mask.bit_count() if s2b_mask is not None else None,
+            total_q,
+            edited_spans=sel.edited_spans,
+        )
     if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
         return 100
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
@@ -680,9 +723,12 @@ def _best_drop_prefix(
     cpu_by_number: dict[int, int],
     min_gain: int,
     limit: int = 200,
+    id_by_number: dict[int, str] | None = None,
+    per_mod_ms: int = 0,
+    min_roi: float = MIN_ROI_RATIO,
 ) -> list[int]:
     """Candidates worth verifying to drop from `pool`: the prefix, cheapest CPU per saved ms
-    first, with the best net (cost saved minus CPU spent), if that net reaches `min_gain`."""
+    first, with the best net (cost saved minus CPU spent), if net >= min_gain and saved >= spent * min_roi."""
     cand_set = set(candidates)
     if not cand_set:
         return []
@@ -708,6 +754,7 @@ def _best_drop_prefix(
     count = len(pool)
     current = _lb_cost(total, ms_by_number[desc[0]] if desc else 0, count)
     removed: set[int] = set()
+    seen_mods: set[str] = set()
     best_net, best, prefix, spent, top = min_gain - 1, [], [], 0, 0
     for num in order[:limit]:
         removed.add(num)
@@ -715,10 +762,16 @@ def _best_drop_prefix(
         total -= ms_by_number[num]
         count -= 1
         spent += cpu_by_number[num]
+        if per_mod_ms and id_by_number is not None:
+            mod_file = id_by_number[num].split("::", 1)[0]
+            if mod_file not in seen_mods:
+                seen_mods.add(mod_file)
+                spent += per_mod_ms
         while top < len(desc) and desc[top] in removed:
             top += 1
-        net = current - _lb_cost(total, ms_by_number[desc[top]] if top < len(desc) else 0, count) - spent
-        if net > best_net:
+        saved = current - _lb_cost(total, ms_by_number[desc[top]] if top < len(desc) else 0, count)
+        net = saved - spent
+        if net > best_net and saved >= spent * min_roi:
             best_net, best = net, list(prefix)
     return best
 
@@ -733,19 +786,22 @@ def _has_decap_prefix_roi(
     ms_by_number: dict[int, int],
     cpu_by_number: dict[int, int],
     tpc_query_mask: dict[int, int] | None = None,
+    tpc_s2b_query_mask: dict[int, int] | None = None,
 ) -> bool:
     """Check if the tallest remaining decap target `elig_rem[0]` belongs to a net-profitable prefix."""
     if not elig_rem:
         return False
     num = elig_rem[0]
-    t_cpu = _est_test_cpu_ms(num, id_by_number[num], sel, tpc_mode, cpu_by_number, tpc_query_mask)
+    t_cpu = _est_test_cpu_ms(num, id_by_number[num], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
     cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
     min_req = MIN_DECAP_GAIN_MS if failed else MIN_GAIN_MS
     trial = set(cur_pool)
     acc_cpu = 0
     for cand in elig_rem:
         trial.discard(cand)
-        acc_cpu += _est_test_cpu_ms(cand, id_by_number[cand], sel, tpc_mode, cpu_by_number, tpc_query_mask)
+        acc_cpu += _est_test_cpu_ms(
+            cand, id_by_number[cand], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask
+        )
         after_c, _ = split_with_cost([(ms_by_number[n], n) for n in trial])
         if (cur_c - after_c) - acc_cpu >= min_req:
             with_num_c, _ = split_with_cost([(ms_by_number[n], n) for n in (trial | {num})])
@@ -801,7 +857,12 @@ def _start_child_verification(
                 try:
                     import sqlglot as _sg
 
-                    lazy_load_ok = len(_sg.Dialect._classes) == 1
+                    # Check both lazy dialect loading AND that test_dialect.py imports cleanly
+                    # (collection fails in pytest if a dialect imported by test_dialect crashes).
+                    lazy_ok = len(_sg.Dialect._classes) == 1
+                    if lazy_ok:
+                        importlib.import_module("tests.dialects.test_dialect")
+                    lazy_load_ok = lazy_ok
                 except BaseException:
                     lazy_load_ok = False
         else:
@@ -865,6 +926,8 @@ def _start_child_verification(
                     cls = getattr(mod, cls_name)
                     if cls_name == "TestExecutor" and not executor_patched:
                         _install_lazy_executor_setup(cls)
+                    elif cls_name == "TestOptimizer" and "tests/test_optimizer.py" not in sel.patched_files:
+                        _install_lazy_optimizer_setup(cls)
                     loaded_classes[key] = cls
                     if cls not in setup_done:
                         cls.setUpClass()
@@ -903,10 +966,11 @@ def _start_child_verification(
 
         def _run_candidate(num: int) -> bool:
             tid = id_by_number[num]
-            if tid == LAZY_LOAD_TEST_ID:
-                # Only the Phase-1 fresh patched import can check it: the real test spawns a
-                # subprocess that imports the unpatched sqlglot from disk and always passes.
-                return bool(lazy_load_ok)
+            if tid == LAZY_LOAD_TEST_ID and "tests/dialects/test_dialect.py" not in sel.patched_files:
+                # The test only imports sqlglot in a subprocess. Phase 1 checked that import (plus
+                # test_dialect collection import) with the patch applied; Phase 2 runs only when no
+                # edited code runs at import (or the built import state is proven unchanged).
+                return True if lazy_load_ok is None and task.phase == 2 else bool(lazy_load_ok)
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
                 signal.alarm(65)
                 try:
@@ -914,18 +978,24 @@ def _start_child_verification(
                         TPC_SUITE_BY_TEST_ID[tid],
                         task.tpc_mode,
                         query_mask=task.tpc_query_mask.get(num),
+                        s2b_query_mask=task.tpc_s2b_query_mask.get(num),
                         patched_files=sel.patched_files,
+                        edited_spans=sel.edited_spans,
                     )
                 except BaseException:
                     return False
                 finally:
                     signal.alarm(0)
-            if tid == OPT_TPCDS_TEST_ID and select_tpcds_ckpt(sel.patched_files, max_stage=14) is not None:
+            if (
+                tid == OPT_TPCDS_TEST_ID
+                and select_tpcds_span(sel.patched_files, max_start=14, for_exec=False, edited_spans=sel.edited_spans)
+                is not None
+            ):
                 signal.alarm(25)
                 try:
                     cf_set = task.case_filter.get(num)
                     indices = {idx for _, idx in cf_set} if cf_set is not None else None
-                    return verify_opt_tpcds(sel.patched_files, indices)
+                    return verify_opt_tpcds(sel.patched_files, indices, edited_spans=sel.edited_spans)
                 except BaseException:
                     return False
                 finally:
@@ -985,7 +1055,9 @@ def _start_child_verification(
 
         if decap_set:
             total_decap_cpu = sum(
-                _est_test_cpu_ms(n, id_by_number[n], sel, task.tpc_mode, cpu_by_number, task.tpc_query_mask)
+                _est_test_cpu_ms(
+                    n, id_by_number[n], sel, task.tpc_mode, cpu_by_number, task.tpc_query_mask, task.tpc_s2b_query_mask
+                )
                 for n in decap_set
             )
             other_rem = verifiable - decap_set
@@ -995,20 +1067,40 @@ def _start_child_verification(
                 and max(other_cpus) <= MAX_SINGLE_TEST_MS
                 and sum(other_cpus) <= MAX_COMMIT_VERIFY_MS
             )
-            # Only run a pre-decap fail-fast probe when decap targets are expensive (>= 1.5s)
-            # or when the remaining tail is small enough to verify completely.
-            need_probe = total_decap_cpu >= 1500 or will_verify_tail
-            other_ordered = sorted(
-                other_rem,
-                key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+            # Only run a pre-decap fail-fast probe when a probe failure can actually block an
+            # expensive non-fast_a TPC decap target (or when the remaining tail will be verified).
+            # Cap at <=5 tests and <=2 modules (preferring already-loaded modules) to avoid mass imports.
+            has_blockable_decap = any(
+                id_by_number[n] in TPC_SUITE_BY_TEST_ID
+                and TPC_SUITE_BY_TEST_ID[id_by_number[n]] == "tpcds"
+                and task.tpc_mode != "fast_a"
+                for n in decap_set
             )
+            need_probe = has_blockable_decap or will_verify_tail
             probe_tests: list[int] = []
-            probe_cpu = 0
-            for num in other_ordered:
-                c_ms = cpu_by_number[num]
-                if need_probe and c_ms <= 450 and probe_cpu + c_ms <= TPC_PROBE_BUDGET_MS:
-                    probe_tests.append(num)
-                    probe_cpu += c_ms
+            if need_probe:
+                other_ordered = sorted(
+                    other_rem,
+                    key=lambda n: (
+                        0 if id_by_number[n].split("::", 1)[0][:-3].replace("/", ".") in sys.modules else 1,
+                        cpu_by_number[n],
+                        ms_by_number[n],
+                        id_by_number[n],
+                    ),
+                )
+                probe_cpu = 0
+                probe_mods: set[str] = set()
+                for num in other_ordered:
+                    c_ms = cpu_by_number[num]
+                    m_name = id_by_number[num].split("::", 1)[0][:-3].replace("/", ".")
+                    if c_ms <= 450 and probe_cpu + c_ms <= TPC_PROBE_BUDGET_MS:
+                        if m_name not in probe_mods and len(probe_mods) >= 2:
+                            continue
+                        probe_mods.add(m_name)
+                        probe_tests.append(num)
+                        probe_cpu += c_ms
+                        if len(probe_tests) >= 5:
+                            break
 
             # Step 2a: Fail-fast probe on cheap unit tests.
             for num in probe_tests:
@@ -1043,17 +1135,28 @@ def _start_child_verification(
                     ms_by_number,
                     cpu_by_number,
                     task.tpc_query_mask,
+                    task.tpc_s2b_query_mask,
                 ):
                     continue
                 _mark(num, _run_candidate(num))
 
         # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
-        # each failure (a failing test stays, but the rest may still be worth dropping).
+        # each failure with adaptive throttling on broad breaking commits.
         if not (sel.fixture_only and not VERIFY_FIXTURE_MAX_MS):
+            per_mod_ms = 20 if task.phase == 1 else 4
             for _ in range(4):
+                if len(failed) >= 2 and not passed:
+                    break
+                cur_roi = 2.6 if (len(failed) >= 2 and len(failed) >= len(passed)) else MIN_ROI_RATIO
                 batch = _best_drop_prefix(
-                    task.chosen - passed, verifiable - passed - failed - decap_set,
-                    ms_by_number, cpu_by_number, MIN_GAIN_MS,
+                    task.chosen - passed,
+                    verifiable - passed - failed - decap_set,
+                    ms_by_number,
+                    cpu_by_number,
+                    MIN_GAIN_MS,
+                    id_by_number=id_by_number,
+                    per_mod_ms=per_mod_ms,
+                    min_roi=cur_roi,
                 )
                 if not batch or all(_mark(num, _run_candidate(num)) for num in batch):
                     break
@@ -1087,6 +1190,7 @@ def _case_plan(
     dict[int, tuple[int, int]],
     dict[int, int],
     dict[int, int],
+    dict[int, int],
 ]:
     """Compute per-case/subTest/Validator/TPC query filters and scaled CPU estimates for `chosen`."""
     global _CASE_MAP
@@ -1094,6 +1198,7 @@ def _case_plan(
     subtest_filter: dict[int, tuple[int, int]] = {}
     validator_filter: dict[int, tuple[int, int]] = {}
     tpc_query_mask: dict[int, int] = {}
+    tpc_s2b_query_mask: dict[int, int] = {}
     cpu_override: dict[int, int] = {}
 
     if sel.edited_spans is not None:
@@ -1125,6 +1230,17 @@ def _case_plan(
                         for ln in s2a.get(path, ())
                     ):
                         tpc_query_mask[num] = 0
+                # Also compute per-query Stage-2b mask for fast_b / full_cached.
+                s2b_lines = entry.get("s2b_lines")
+                if s2b_lines:
+                    s2b_mask = 0
+                    for path, first, last in sel.edited_spans:
+                        per_line = s2b_lines.get(path)
+                        if per_line:
+                            for line in range(first, last + 1):
+                                s2b_mask |= per_line.get(line, 0)
+                    if s2b_mask:
+                        tpc_s2b_query_mask[num] = s2b_mask
                 continue
             # Soundness guard: if a selected test matched 0 recorded cases, run it unfiltered.
             if not mask:
@@ -1134,34 +1250,34 @@ def _case_plan(
                 matched = {tuple(cases[k]) for k in range(len(cases)) if mask >> k & 1}
                 if len(matched) < len(cases):
                     case_filter[num] = matched
-                    cpu_override[num] = max(20, base_cpu[num] * (len(matched) + 1) // (len(cases) + 1))
+                    cpu_override[num] = max(25, base_cpu[num] * (len(matched) + 1) // (len(cases) + 1))
             elif kind == "subtest":
                 count = entry["count"]
                 hits = mask.bit_count()
                 if hits < count:
                     subtest_filter[num] = (mask, entry.get("stride", 1))
-                    cpu_override[num] = max(20, base_cpu[num] * (hits + 1) // (count + 1))
+                    cpu_override[num] = max(25, base_cpu[num] * (hits + 1) // (count + 1))
             elif kind == "validator":
                 count = entry["count"]
                 full_mask = mask | entry.get("always", 0)
                 hits = full_mask.bit_count()
                 if hits < count:
                     validator_filter[num] = (full_mask, entry.get("stride", 1))
-                    cpu_override[num] = max(10, base_cpu[num] * (hits + 1) // (count + 1))
+                    cpu_override[num] = max(12, base_cpu[num] * (hits + 1) // (count + 1))
 
-    # Apply TPC-DS optimizer rule-stage checkpoint CPU estimate to TestOptimizer.test_tpcds.
-    ckpt_info = select_tpcds_ckpt(sel.patched_files, max_stage=14)
-    if ckpt_info is not None:
-        _, ckpt_est_ms = ckpt_info
+    # Apply TPC-DS optimizer rule-stage checkpoint/suffix-span CPU estimate to TestOptimizer.test_tpcds.
+    span_info = select_tpcds_span(sel.patched_files, max_start=14, for_exec=False, edited_spans=sel.edited_spans)
+    if span_info is not None:
+        _, _, ckpt_est_ms = span_info
         for num in chosen:
             if id_by_number[num] == OPT_TPCDS_TEST_ID:
                 if num in case_filter:
-                    scaled = max(35, ckpt_est_ms * (len(case_filter[num]) + 1) // 100)
+                    scaled = max(45, ckpt_est_ms * (len(case_filter[num]) + 1) // 100)
                 else:
                     scaled = ckpt_est_ms
                 cpu_override[num] = min(cpu_override.get(num, base_cpu[num]), scaled)
 
-    return case_filter, subtest_filter, validator_filter, tpc_query_mask, cpu_override
+    return case_filter, subtest_filter, validator_filter, tpc_query_mask, tpc_s2b_query_mask, cpu_override
 
 
 def plan_verification(
@@ -1176,7 +1292,7 @@ def plan_verification(
     for commit, chosen, sel in commits:
         if not chosen or not sel.patched_files or sel.reason.startswith("everything"):
             continue
-        case_filter, subtest_filter, validator_filter, tpc_query_mask, cpu_override = _case_plan(
+        case_filter, subtest_filter, validator_filter, tpc_query_mask, tpc_s2b_query_mask, cpu_override = _case_plan(
             chosen, sel, id_by_number, base_cpu
         )
         cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else base_cpu
@@ -1193,7 +1309,8 @@ def plan_verification(
             and not any(tid in FRESH_IMPORT_TESTS for tid in tids)
         )
         phase = 2 if can_phase2 else 1
-        overhead_ms = 30 if phase == 2 else 280
+        overhead_ms = 35 if phase == 2 else 320
+        per_mod_ms = 4 if phase == 2 else 20
 
         lazy_pp_nums: set[int] = set()
         if sel.lazy_pp_mask and number_by_index is not None:
@@ -1223,21 +1340,20 @@ def plan_verification(
             if tid in TPC_SUITE_BY_TEST_ID:
                 if tpc_mode is None:
                     continue
-                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask)
+                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
                 raw_decap.append((sim_ms, c_ms, num))
             elif tid in (OPT_TPCH_TEST_ID, MAX_NODES_TEST_ID, GEN_MEM_TEST_ID, LAZY_LOAD_TEST_ID):
-                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask)
+                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
                 if c_ms < sim_ms:
                     raw_decap.append((sim_ms, c_ms, num))
             elif sim_ms >= 150:
                 c_ms = cpu_by_number[num]
-                if c_ms <= sim_ms * 0.85:
+                if c_ms <= sim_ms * 0.72:
                     raw_decap.append((sim_ms, c_ms, num))
 
         # Pick the prefix with the best net makespan / worker-count reduction, trying two
         # orders: tallest-first (knock down the ceiling) and cheapest-per-saved-ms first (so a
         # nearly free test is not stuck behind expensive taller ones).
-        # Planning cost grows with candidates: keep the 30 with the largest possible saving.
         raw_decap = sorted(raw_decap, key=lambda item: (item[1] - item[0], item[2]))[:30]
         cur_pool = chosen - lazy_pp_nums
         cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
@@ -1266,36 +1382,49 @@ def plan_verification(
 
         decap_targets = list(best_prefix)
         decap_set = set(decap_targets)
-        # Tail: the other verifiable tests worth dropping, as the best ROI prefix (the child
-        # re-plans the same way as results come in, failures included).
+
         def plan_tail(pool: set[int], cands: set[int]) -> tuple[list[int], int]:
             if sel.fixture_only and not VERIFY_FIXTURE_MAX_MS:
                 return [], 0  # a fixture edit almost always breaks the tests reading it
-            prefix = _best_drop_prefix(pool, cands, ms_by_number, cpu_by_number, MIN_GAIN_MS)
-            return prefix, sum(cpu_by_number[n] for n in prefix)
+            prefix = _best_drop_prefix(
+                pool,
+                cands,
+                ms_by_number,
+                cpu_by_number,
+                MIN_GAIN_MS,
+                id_by_number=id_by_number,
+                per_mod_ms=per_mod_ms,
+                min_roi=MIN_ROI_RATIO,
+            )
+            mod_count = len({id_by_number[n].split("::", 1)[0] for n in prefix})
+            return prefix, sum(cpu_by_number[n] for n in prefix) + mod_count * per_mod_ms
 
         decap_cpu = sum(
-            _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number, tpc_query_mask)
+            _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask)
             for n in decap_targets
         ) + (15 if lazy_pp_nums else 0)
         pool_after_decap = chosen - lazy_pp_nums - decap_set
         tail_prefix, tail_cpu = plan_tail(pool_after_decap, rem_verifiable - decap_set)
         cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_decap - set(tail_prefix)])
         est_cpu_ms = overhead_ms + decap_cpu + tail_cpu
-        expected_gain_ms = (static_cost_ms - cost_after) - est_cpu_ms
+        saved_ms = static_cost_ms - cost_after
+        expected_gain_ms = saved_ms - est_cpu_ms
         has_heavy_tpc_or_max = any(
             id_by_number[n] in TPC_SUITE_BY_TEST_ID or id_by_number[n] == MAX_NODES_TEST_ID for n in decap_targets
         )
         min_req = TPC_MIN_GAIN_MS if has_heavy_tpc_or_max else MIN_DECAP_GAIN_MS if decap_targets else MIN_GAIN_MS
-        if expected_gain_ms < min_req and decap_targets:
+        roi_ok = (saved_ms >= est_cpu_ms * MIN_ROI_RATIO) or (saved_ms >= 5000 and expected_gain_ms >= 2500)
+        if (expected_gain_ms < min_req or not roi_ok) and decap_targets:
             # Without the decapitation targets, the tail alone may still pay off.
             decap_targets = []
             tail_prefix, tail_cpu = plan_tail(chosen - lazy_pp_nums, rem_verifiable)
             cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in chosen - lazy_pp_nums - set(tail_prefix)])
             est_cpu_ms = overhead_ms + (15 if lazy_pp_nums else 0) + tail_cpu
-            expected_gain_ms = (static_cost_ms - cost_after) - est_cpu_ms
+            saved_ms = static_cost_ms - cost_after
+            expected_gain_ms = saved_ms - est_cpu_ms
             min_req = MIN_GAIN_MS
-        if not (decap_targets or tail_prefix or lazy_pp_nums) or expected_gain_ms < min_req:
+            roi_ok = saved_ms >= est_cpu_ms * MIN_ROI_RATIO
+        if not (decap_targets or tail_prefix or lazy_pp_nums) or expected_gain_ms < min_req or not roi_ok:
             continue
 
         candidates.append(
@@ -1314,6 +1443,7 @@ def plan_verification(
                 subtest_filter=subtest_filter,
                 validator_filter=validator_filter,
                 tpc_query_mask=tpc_query_mask,
+                tpc_s2b_query_mask=tpc_s2b_query_mask,
                 cpu_override=cpu_override,
             )
         )
@@ -1336,6 +1466,9 @@ def plan_verification(
             phase2.append(task)
     phase1.sort(key=lambda t: t.commit)
     phase2.sort(key=lambda t: t.commit)
+    # Free the 7MB case map before forking children (tasks already hold extracted filters).
+    global _CASE_MAP
+    _CASE_MAP = None
     return phase1, phase2
 
 
@@ -1377,23 +1510,43 @@ def _prewarm_for_phase2(
         if count >= 2:
             needed_mods.add(mod)
 
-    # Install lazy numpy/pandas stubs BEFORE importing tests.test_optimizer or tests.test_executor!
-    if ("tests.test_executor" in needed_mods or "tests.test_optimizer" in needed_mods) and not any(
-        (id_by_number[n] in TPC_SUITE_BY_TEST_ID and not t.tpc_mode)
-        or (id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(t.selection))
+    # Install lazy numpy/pandas stubs unconditionally in Phase-2 parent unless a task needs real
+    # TPC pandas/numpy or patches test_executor.py — saves ~1.5s in any child importing test_executor.
+    if not any(
+        "tests/test_executor.py" in t.selection.patched_files
+        or any(
+            (id_by_number[n] in TPC_SUITE_BY_TEST_ID and not t.tpc_mode)
+            or (id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(t.selection))
+            for n in t.chosen
+        )
         for t in phase2_tasks
-        for n in t.chosen
     ):
         _install_lazy_data_libs()
 
     for mod_name in sorted(needed_mods):
         if mod_name not in sys.modules:
             try:
-                importlib.import_module(mod_name)
+                mod = importlib.import_module(mod_name)
                 if mod_name in ("tests.test_optimizer", "tests.test_executor"):
                     _patch_pool_references()
+                if mod_name == "tests.test_optimizer":
+                    _install_case_filter(mod)
+                    _install_lazy_optimizer_setup(mod.TestOptimizer)
             except Exception as err:
                 log(f"prewarm skip {mod_name}: {err}")
+
+    # Pre-install subTest AST wrappers and Validator filter once in parent for Phase-2 COW sharing.
+    has_val_filter = any(t.validator_filter for t in phase2_tasks)
+    if has_val_filter and "tests.dialects.test_dialect" in sys.modules:
+        _install_validator_filter()
+    for task in phase2_tasks:
+        for num in task.subtest_filter:
+            parts = id_by_number[num].split("::")
+            if len(parts) == 3:
+                mod_name = parts[0][:-3].replace("/", ".")
+                mod = sys.modules.get(mod_name)
+                if mod is not None and hasattr(mod, parts[1]):
+                    _install_subtest_filter(mod, getattr(mod, parts[1]), parts[2])
 
 
 def _run_batch_parallel(
@@ -1440,7 +1593,7 @@ def _run_batch_parallel(
         dtag = f" decap={len(task.decap_targets)}" if task.decap_targets else ""
         end = " TIMEOUT" if timed_out else ("" if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else f" status={status}")
         log(
-            f"{task.commit}: p{task.phase}{mtag}{dtag} cpu={child_cpu:.3f}s "
+            f"{task.commit}: p{task.phase}{mtag}{dtag} cpu={child_cpu:.3f}s est={task.est_cpu_ms / 1000:.3f}s gain={task.expected_gain_ms / 1000:.1f}s "
             f"pass={len(passed_set)} fail={len(failed_ids)}/{len(task.chosen)}{end} failed={failed_ids[:5]}"
         )
         verified[task.commit] = task.chosen - passed_set
@@ -1513,10 +1666,19 @@ def verify_batches(
     if not all_tasks:
         return verified
 
-    # Only pre-import duckdb in parent if a scheduled task will actually run test_optimizer
-    # or real-unittest test_executor tests (fast cached TPC / opt_tpch never use duckdb).
+    # Only pre-import duckdb in parent if a scheduled task may run a test that imports
+    # test_optimizer (not fast verify_opt_tpcds) or real-unittest test_executor.
     needs_duckdb = any(
-        id_by_number[n].startswith("tests/test_optimizer.py::")
+        (
+            id_by_number[n].startswith("tests/test_optimizer.py::")
+            and not (
+                id_by_number[n] == OPT_TPCDS_TEST_ID
+                and select_tpcds_span(
+                    t.selection.patched_files, max_start=14, for_exec=False, edited_spans=t.selection.edited_spans
+                )
+                is not None
+            )
+        )
         or (
             id_by_number[n].startswith("tests/test_executor.py::")
             and not (t.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
@@ -1543,10 +1705,13 @@ def verify_batches(
     stop_at = started + min(VERIFY_WALL_BUDGET_S * _budget_scale(n_commits), 200.0)
 
     if phase1:
+        # Freeze parent heap so forked children don't trigger a full Gen-2 GC / COW storm (~0.6s/child).
+        gc.freeze()
         _run_batch_parallel(phase1, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified, started)
 
     if phase2 and time.monotonic() < stop_at:
         _prewarm_for_phase2(phase2, id_by_number, ms_by_number, cpu_by_number)
+        gc.freeze()
         _run_batch_parallel(phase2, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified, started)
 
     return verified

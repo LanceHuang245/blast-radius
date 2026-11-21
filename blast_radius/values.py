@@ -126,7 +126,12 @@ def site_mutations(old_tree: ast.AST, new_tree: ast.AST, touched: set[int] | Non
                     return False
                 muts.append((o, n, parent, field))
                 return True
-            if isinstance(o, (ast.stmt, ast.expr)) and _dump(o) == _dump(n):
+            if (
+                isinstance(o, (ast.stmt, ast.expr))
+                and not isinstance(o, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                and (o.end_lineno - o.lineno) <= 5
+                and _dump(o) == _dump(n)
+            ):
                 return True
             inner = depth + 1 if isinstance(o, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) else depth
             for name, vo in ast.iter_fields(o):
