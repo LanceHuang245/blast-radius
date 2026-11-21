@@ -30,8 +30,10 @@ def main() -> None:
     impact = ImpactMap(MAP_FILE)
     # Uncalibrated tests are single-threaded unit/dialect tests whose measured in-process CPU
     # averages ~0.68x of recorded seconds (heavy multiprocess optimizer tests are calibrated).
+    # BR_CPU_SCALE: safety factor on CPU estimates (see blast_radius.verify.CPU_SCALE).
+    cpu_scale = float(os.environ.get("BR_CPU_SCALE", "2.0"))
     cpu_by_number = {
-        t["number"]: impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 750)) for t in tests
+        t["number"]: round(impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 750)) * cpu_scale) for t in tests
     }
     selector = Selector(impact)
     numbers = [number_by_id.get(test_id) for test_id in impact.test_ids]

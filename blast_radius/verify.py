@@ -67,6 +67,10 @@ ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
 TPC_PROBE_BUDGET_MS = int(os.environ.get("BR_TPC_PROBE_MS", "300"))
 TPC_MIN_GAIN_MS = int(os.environ.get("BR_TPC_MIN_GAIN_MS", "1800"))
 MAX_PARALLEL_CHILDREN = int(os.environ.get("BR_PARALLEL", "2"))
+# Safety factor on the dedicated verifiers' (TPC, max_nodes, ...) CPU estimates; per-test
+# estimates get BR_CPU_SCALE in __main__ (practice showed those too optimistic: c624afb spent
+# +35 s CPU for -22 s simulated).
+SPECIAL_CPU_SCALE = float(os.environ.get("BR_SPECIAL_CPU_SCALE", "1.0"))
 
 # Hard wall-clock limits, enforced by the parent (the run itself has 3 minutes, 4.5 in the final).
 CHILD_LIMIT_BASE_S = 8.0
@@ -621,7 +625,21 @@ def _est_test_cpu_ms(
     cpu_by_number: dict[int, int],
     tpc_query_mask: dict[int, int] | None = None,
 ) -> int:
-    """Return best realistic CPU estimate (ms) for verifying test `num` on `sel`."""
+    """Return the CPU estimate (ms) for verifying test `num` on `sel`, safety factor included."""
+    special = _special_cpu_ms(num, tid, sel, tpc_mode, tpc_query_mask)
+    # cpu_by_number already carries BR_CPU_SCALE (applied in __main__); dedicated verifiers'
+    # estimates are measured end to end and use their own factor.
+    return cpu_by_number[num] if special is None else round(special * SPECIAL_CPU_SCALE)
+
+
+def _special_cpu_ms(
+    num: int,
+    tid: str,
+    sel: Selection,
+    tpc_mode: str | None,
+    tpc_query_mask: dict[int, int] | None,
+) -> int | None:
+    """Raw CPU estimate for tests with a dedicated fast verifier, else None."""
     if tid == LAZY_LOAD_TEST_ID and "tests/dialects/test_dialect.py" not in sel.patched_files:
         return 5
     if tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
@@ -645,7 +663,7 @@ def _est_test_cpu_ms(
         can_fast, is_scoped = _can_fast_gen_mem(sel)
         if can_fast and is_scoped:
             return 550
-    return cpu_by_number[num]
+    return None
 
 
 def _lb_cost(total: int, biggest: int, count: int) -> int:
@@ -885,8 +903,10 @@ def _start_child_verification(
 
         def _run_candidate(num: int) -> bool:
             tid = id_by_number[num]
-            if tid == LAZY_LOAD_TEST_ID and lazy_load_ok is not None:
-                return lazy_load_ok
+            if tid == LAZY_LOAD_TEST_ID:
+                # Only the Phase-1 fresh patched import can check it: the real test spawns a
+                # subprocess that imports the unpatched sqlglot from disk and always passes.
+                return bool(lazy_load_ok)
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
                 signal.alarm(65)
                 try:
