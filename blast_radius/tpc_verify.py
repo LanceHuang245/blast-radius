@@ -44,13 +44,52 @@ TPC_DISALLOWED_FILES = frozenset({
 
 # Measured Docker CPU estimates (ms) used for ROI gating and parent deadline sizing.
 TPC_EST_CPU_MS = {
-    ("tpcds", "fast_a"): 4300,
+    ("tpcds", "fast_a"): 3000,
     ("tpcds", "fast_b"): 12800,
-    ("tpcds", "full_cached"): 17000,
-    ("tpch", "fast_a"): 600,
+    ("tpcds", "full_cached"): 16500,
+    ("tpch", "fast_a"): 450,
     ("tpch", "fast_b"): 1500,
-    ("tpch", "full_cached"): 2100,
+    ("tpch", "full_cached"): 2000,
 }
+
+# Exact file footprints of Plan(opt_expr) and Python().generator() in Stage 1 / 2a.
+_PLAN_FILES = frozenset({
+    "sqlglot/planner.py",
+    "sqlglot/optimizer/eliminate_joins.py",
+    "sqlglot/optimizer/normalize.py",
+    "sqlglot/optimizer/scope.py",
+    "sqlglot/expressions/builders.py",
+    "sqlglot/expressions/core.py",
+    "sqlglot/expressions/query.py",
+    "sqlglot/helper.py",
+})
+
+_PYGEN_FILES = frozenset({
+    "sqlglot/dialects/dialect.py",
+    "sqlglot/executor/python.py",
+    "sqlglot/expressions/core.py",
+    "sqlglot/generator.py",
+    "sqlglot/generators/python.py",
+    "sqlglot/helper.py",
+    "sqlglot/transforms.py",
+})
+
+_OPT_DIALECT_STEMS = frozenset({"dialect", "__init__", "base", "athena", "trino", "presto", "mysql", "hive"})
+
+
+def _can_skip_tpc_optimize(patched_files: dict[str, str] | None) -> bool:
+    """Return True if no patched file can execute during Stage-1 `optimize(expr, ensured_schema)`."""
+    if not patched_files:
+        return False
+    for p in patched_files:
+        if p in ("sqlglot/planner.py", "sqlglot/executor/python.py", "sqlglot/generators/python.py", "sqlglot/generators/duckdb.py"):
+            continue
+        if p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
+            stem = p.rsplit("/", 1)[-1].removesuffix(".py")
+            if stem not in _OPT_DIALECT_STEMS:
+                continue
+        return False
+    return True
 
 _meta_cache: dict | None = None
 
@@ -121,9 +160,9 @@ def _rows_equal(cols_a, rows_a, cols_b, rows_b) -> bool:
     return True
 
 
-def verify_tpc_test(suite_name: str, mode: str) -> bool:
+def verify_tpc_test(suite_name: str, mode: str, patched_files: dict[str, str] | None = None) -> bool:
     """Verify test_execute_tpcds or test_execute_tpch in the forked child; True iff proven PASS."""
-    from sqlglot import find_tables, parse_one, transpile
+    from sqlglot import Dialect, find_tables, parse_one
     from sqlglot.executor.python import Python, PythonExecutor
     from sqlglot.executor.table import Table, ensure_tables
     from sqlglot.optimizer import optimize
@@ -132,10 +171,16 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
     from sqlglot.serde import dump as serde_dump
     from sqlglot.serde import load as serde_load
 
+    duck_gen = Dialect.get_or_raise("duckdb").generator()
+
     if mode == "fast_a":
         with open(TPC_STAGE1_FILE, "rb") as handle:
             s1 = pickle.load(handle)[suite_name]
-        schema = s1["schema"]
+        ensured_schema = ensure_schema(s1["schema"])
+        skip_opt = _can_skip_tpc_optimize(patched_files)
+        need_plan = not patched_files or bool(_PLAN_FILES & patched_files.keys())
+        need_pygen = not patched_files or bool(_PYGEN_FILES & patched_files.keys())
+
         # Stage 1: parse all queries + find_tables + DuckDB transpile + ensure_schema + optimize + Plan.
         for q in s1["queries"]:
             expr = parse_one(q["sql"])
@@ -143,21 +188,27 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
                 continue
             if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
                 return False
-            if transpile(q["sql"], write="duckdb")[0] != q["duckdb_sql"]:
+            if duck_gen.generate(expr) != q["duckdb_sql"]:
                 return False
-            ensured_schema = ensure_schema(schema)
-            opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
-            if serde_dump(opt_expr) != q["opt_dump"]:
-                return False
-            plan = Plan(opt_expr)
-            if plan_signature(plan, serde_dump) != q["plan_sig"]:
-                return False
+            if not skip_opt:
+                opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
+                if serde_dump(opt_expr) != q["opt_dump"]:
+                    return False
+                if need_plan:
+                    plan = Plan(opt_expr)
+                    if plan_signature(plan, serde_dump) != q["plan_sig"]:
+                        return False
+            elif need_plan:
+                plan = Plan(serde_load(q["opt_dump"]))
+                if plan_signature(plan, serde_dump) != q["plan_sig"]:
+                    return False
 
         # Stage 2a: Python().generator codegen parity on every expression generated during execution.
-        py_gen = Python().generator(identify=True, comments=False)
-        for expr_dump, expected_py in s1["gen_pairs"]:
-            if py_gen.generate(serde_load(expr_dump)) != expected_py:
-                return False
+        if need_pygen:
+            py_gen = Python().generator(identify=True, comments=False)
+            for expr_dump, expected_py in s1["gen_pairs"]:
+                if py_gen.generate(serde_load(expr_dump)) != expected_py:
+                    return False
         return True
 
     with open(TPC_STAGE2_FILE, "rb") as handle:
@@ -186,15 +237,15 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
     # Full cached path: Stage 1 + Stage 2 + DuckDB transpile parity (no CSV/DuckDB/spawn).
     with open(TPC_STAGE1_FILE, "rb") as handle:
         s1 = pickle.load(handle)[suite_name]
+    ensured_schema = ensure_schema(schema)
     for q1, q2 in zip(s1["queries"], s2["queries"]):
         expr = parse_one(q1["sql"])
         if not q1["execute"]:
             continue
-        if transpile(q1["sql"], write="duckdb")[0] != q1["duckdb_sql"]:
+        if duck_gen.generate(expr) != q1["duckdb_sql"]:
             return False
         q_tables = {t.name: tables_by_name[t.name] for t in find_tables(expr)}
         tables_ = ensure_tables(q_tables)
-        ensured_schema = ensure_schema(schema)
         if tables_.supported_table_args and tables_.supported_table_args != ensured_schema.supported_table_args:
             return False
         opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)

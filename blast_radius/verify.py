@@ -42,6 +42,7 @@ from blast_radius.select import Selection
 from blast_radius.tpc_verify import (
     TPC_EST_CPU_MS,
     TPC_SUITE_BY_TEST_ID,
+    _can_skip_tpc_optimize,
     select_tpc_mode,
     verify_generator_memory,
     verify_lazy_athena_presto,
@@ -65,7 +66,7 @@ TPC_MIN_GAIN_MS = int(os.environ.get("BR_TPC_MIN_GAIN_MS", "1800"))
 MAX_PARALLEL_CHILDREN = int(os.environ.get("BR_PARALLEL", "2"))
 
 # Hard wall-clock limits, enforced by the parent (the run itself has 3 minutes, 4.5 in the final).
-CHILD_LIMIT_BASE_S = 5.0
+CHILD_LIMIT_BASE_S = 8.0
 CHILD_LIMIT_FACTOR = 3.0
 VERIFY_WALL_BUDGET_S = float(os.environ.get("BR_VERIFY_WALL_S", "130"))
 
@@ -475,7 +476,10 @@ def _est_test_cpu_ms(
 ) -> int:
     """Return best realistic CPU estimate (ms) for verifying test `num` on `sel`."""
     if tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
-        return TPC_EST_CPU_MS[(TPC_SUITE_BY_TEST_ID[tid], tpc_mode)]
+        suite = TPC_SUITE_BY_TEST_ID[tid]
+        if tpc_mode == "fast_a" and _can_skip_tpc_optimize(sel.patched_files):
+            return 450 if suite == "tpcds" else 120
+        return TPC_EST_CPU_MS[(suite, tpc_mode)]
     if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
         return 100
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
@@ -489,19 +493,60 @@ def _est_test_cpu_ms(
 
 
 def _should_continue_after_failure(
-    failed: set[int],
-    unverified: set[int],
+    cur_pool: set[int],
+    unverified_ordered: list[int],
     ms_by_number: dict[int, int],
     cpu_by_number: dict[int, int],
 ) -> bool:
-    """Only continue running tests after a failure if dropping them saves strictly more than real CPU."""
-    if not unverified:
+    """Return True if any prefix of `unverified_ordered` (sorted tallest-first) nets >= 80ms in an active child."""
+    if not unverified_ordered:
         return False
-    cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in (failed | unverified)])
-    only_fail_cost, _ = split_with_cost([(ms_by_number[n], n) for n in failed])
-    max_possible_savings = cur_cost - only_fail_cost
-    rem_cpu = sum(cpu_by_number[n] for n in unverified)
-    return max_possible_savings >= 1500 and rem_cpu < max_possible_savings * 0.65
+    first = unverified_ordered[0]
+    if cpu_by_number[first] >= ms_by_number[first]:
+        return False
+    cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
+    trial = set(cur_pool)
+    acc_cpu = 0
+    for num in unverified_ordered:
+        c_ms = cpu_by_number[num]
+        if c_ms >= ms_by_number[num]:
+            break
+        trial.discard(num)
+        acc_cpu += c_ms
+        new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial])
+        if (cur_cost - new_cost) - acc_cpu >= 80:
+            return True
+    return False
+
+
+def _has_decap_prefix_roi(
+    cur_pool: set[int],
+    elig_rem: list[int],
+    failed: set[int],
+    sel: Selection,
+    tpc_mode: str | None,
+    id_by_number: dict[int, str],
+    ms_by_number: dict[int, int],
+    cpu_by_number: dict[int, int],
+) -> bool:
+    """Check if the tallest remaining decap target `elig_rem[0]` belongs to a net-profitable prefix."""
+    if not elig_rem:
+        return False
+    num = elig_rem[0]
+    t_cpu = _est_test_cpu_ms(num, id_by_number[num], sel, tpc_mode, cpu_by_number)
+    cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
+    min_req = MIN_DECAP_GAIN_MS if failed else MIN_GAIN_MS
+    trial = set(cur_pool)
+    acc_cpu = 0
+    for cand in elig_rem:
+        trial.discard(cand)
+        acc_cpu += _est_test_cpu_ms(cand, id_by_number[cand], sel, tpc_mode, cpu_by_number)
+        after_c, _ = split_with_cost([(ms_by_number[n], n) for n in trial])
+        if (cur_c - after_c) - acc_cpu >= min_req:
+            with_num_c, _ = split_with_cost([(ms_by_number[n], n) for n in (trial | {num})])
+            if with_num_c - after_c > t_cpu:
+                return True
+    return False
 
 
 def _start_child_verification(
@@ -614,7 +659,7 @@ def _start_child_verification(
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
                 signal.alarm(65)
                 try:
-                    return verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode)
+                    return verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode, sel.patched_files)
                 except BaseException:
                     return False
                 finally:
@@ -687,9 +732,19 @@ def _start_child_verification(
             # Only run a pre-decap fail-fast probe when decap targets are expensive (>= 1.5s)
             # or when the remaining tail is small enough to verify completely.
             need_probe = total_decap_cpu >= 1500 or will_verify_tail
+            patched_stems = {
+                p.rsplit("/", 1)[-1].removesuffix(".py")
+                for p in sel.patched_files
+                if p.endswith(".py")
+            } - {"__init__", "dialect", "base", "core", "helper"}
             other_ordered = sorted(
                 other_rem,
-                key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+                key=lambda n: (
+                    0 if (not will_verify_tail and cpu_by_number[n] <= 120 and any(s in id_by_number[n] for s in patched_stems)) else 1,
+                    cpu_by_number[n],
+                    ms_by_number[n],
+                    id_by_number[n],
+                ),
             )
             probe_tests: list[int] = []
             tail_tests: list[int] = []
@@ -707,39 +762,29 @@ def _start_child_verification(
                 if not _mark(num, _run_candidate(num)):
                     break
 
-            # Step 2b: Makespan decapitation on heavy bottleneck tests (even after probe failure
-            # for ultra-high-ROI non-TPC verifiers like opt_tpch, gen_mem, canonicalize, max_nodes).
+            # Step 2b: Makespan & worker-collapsing decapitation ordered tallest-first so
+            # larger ceilings are resolved before smaller targets beneath them are evaluated.
             decap_ordered = [n for n in task.decap_targets if n in decap_set]
-            rem_decap = list(decap_ordered)
             for idx, num in enumerate(decap_ordered):
-                rem_decap = decap_ordered[idx:]
-                tid = id_by_number[num]
-                t_cpu = _est_test_cpu_ms(num, tid, sel, task.tpc_mode, cpu_by_number)
-                if failed:
-                    # A broken commit can still leave TPC passing; only the cheap fail-fast
-                    # fast_a check is worth the gamble once a unit probe already failed.
-                    if tid in TPC_SUITE_BY_TEST_ID and task.tpc_mode != "fast_a":
-                        continue
-                    # For non-TPC decap targets after a probe failure, require strong standalone ROI.
-                    cur_pool = task.chosen - passed
-                    cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
-                    without_c, _ = split_with_cost([(ms_by_number[n], n) for n in (cur_pool - {num})])
-                    if (cur_c - without_c) - t_cpu < MIN_DECAP_GAIN_MS:
-                        continue
-                else:
-                    # Check joint remaining decapitation ROI against current pool.
-                    cur_pool = task.chosen - passed
-                    cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
-                    without_rem_c, _ = split_with_cost(
-                        [(ms_by_number[n], n) for n in (cur_pool - set(rem_decap))]
-                    )
-                    rem_cpu = sum(
-                        _est_test_cpu_ms(x, id_by_number[x], sel, task.tpc_mode, cpu_by_number)
-                        for x in rem_decap
-                    )
-                    if (cur_c - without_rem_c) - rem_cpu < MIN_GAIN_MS:
-                        continue
-
+                if failed and id_by_number[num] in TPC_SUITE_BY_TEST_ID and task.tpc_mode != "fast_a":
+                    continue
+                elig_rem = [
+                    x
+                    for x in decap_ordered[idx:]
+                    if not (failed and id_by_number[x] in TPC_SUITE_BY_TEST_ID and task.tpc_mode != "fast_a")
+                ]
+                cur_pool = task.chosen - passed
+                if not _has_decap_prefix_roi(
+                    cur_pool,
+                    elig_rem,
+                    failed,
+                    sel,
+                    task.tpc_mode,
+                    id_by_number,
+                    ms_by_number,
+                    cpu_by_number,
+                ):
+                    continue
                 _mark(num, _run_candidate(num))
 
             # Step 2c: If no failures so far, verify remaining tail if dropping it beats its real CPU.
@@ -757,12 +802,19 @@ def _start_child_verification(
                 ):
                     unverified = set(tail_tests)
                     for num in tail_tests:
-                        if failed and not _should_continue_after_failure(
-                            failed, unverified, ms_by_number, cpu_by_number
-                        ):
+                        if num not in unverified:
+                            continue
+                        if failed:
                             break
                         unverified.discard(num)
                         _mark(num, _run_candidate(num))
+                    if failed and unverified:
+                        for num in sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n])):
+                            rem_list = sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n]))
+                            if not _should_continue_after_failure(task.chosen - passed, rem_list, ms_by_number, cpu_by_number):
+                                break
+                            unverified.discard(num)
+                            _mark(num, _run_candidate(num))
         elif verifiable:
             rem_cpus = [cpu_by_number[n] for n in verifiable]
             if not task.lazy_pp_nums or (
@@ -774,12 +826,19 @@ def _start_child_verification(
                 )
                 unverified = set(ordered)
                 for num in ordered:
-                    if failed and not _should_continue_after_failure(
-                        failed, unverified, ms_by_number, cpu_by_number
-                    ):
+                    if num not in unverified:
+                        continue
+                    if failed:
                         break
                     unverified.discard(num)
                     _mark(num, _run_candidate(num))
+                if failed and unverified:
+                    for num in sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n])):
+                        rem_list = sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n]))
+                        if not _should_continue_after_failure(task.chosen - passed, rem_list, ms_by_number, cpu_by_number):
+                            break
+                        unverified.discard(num)
+                        _mark(num, _run_candidate(num))
     except BaseException:
         pass
     finally:
@@ -837,7 +896,7 @@ def plan_verification(
 
         rem_verifiable = verifiable - lazy_pp_nums
 
-        # Identify high-ROI heavy decapitation targets inside rem_verifiable.
+        # Identify high-ROI heavy and medium peak-shaving targets inside rem_verifiable.
         raw_decap: list[tuple[int, int, int]] = []  # (sim_ms, est_cpu_ms, num)
         for num in rem_verifiable:
             tid = id_by_number[num]
@@ -855,9 +914,13 @@ def plan_verification(
                 c_ms = cpu_by_number[num]
                 if c_ms <= sim_ms * 0.78:
                     raw_decap.append((sim_ms, c_ms, num))
+            elif sim_ms >= 180 and static_cost_ms >= 6000 and len(rem_verifiable) >= 10:
+                c_ms = cpu_by_number[num]
+                if c_ms <= sim_ms * 0.65:
+                    raw_decap.append((sim_ms, c_ms, num))
 
-        # Order decapitation targets by execution CPU ascending (cheapest proof first)
-        # while selecting the greedy prefix that maximizes net makespan reduction.
+        # Order decapitation targets tallest-first (-sim_ms, est_cpu_ms, num) and select
+        # the greedy prefix that maximizes net makespan / worker-count reduction.
         raw_decap.sort(key=lambda item: (-item[0], item[1], item[2]))
         chosen_decap: list[int] = []
         cur_pool = chosen - lazy_pp_nums
@@ -872,19 +935,12 @@ def plan_verification(
             new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial_pool])
             net = (static_cost_ms - new_cost) - acc_decap_cpu - (15 if lazy_pp_nums else 0)
             chosen_decap.append(num)
-            if net >= best_net + 300:
+            if net >= best_net + 250:
                 best_net = net
                 best_prefix = list(chosen_decap)
 
-        # Sort selected decap targets by estimated CPU ascending so cheap verifiers run first.
-        decap_targets = sorted(
-            best_prefix,
-            key=lambda n: (
-                _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number),
-                -ms_by_number[n],
-                id_by_number[n],
-            ),
-        )
+        # Keep selected decap targets ordered tallest-first so dominant ceilings are knocked down first.
+        decap_targets = list(best_prefix)
         decap_set = set(decap_targets)
         tail_nums = rem_verifiable - decap_set
         tail_cpus = [cpu_by_number[n] for n in tail_nums]

@@ -24,7 +24,7 @@ RUN PYTHONPATH=/app python -m blast_radius.precompile
 
 COPY blast_radius/ /app/blast_radius/
 RUN python -m compileall -q /app/blast_radius \
-    && chmod -R a+rX /app
+    && chmod -R a+rX /app/blast_radius /app/map
 
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
