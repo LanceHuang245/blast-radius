@@ -276,6 +276,8 @@ def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dic
             _install_open_overlay(patched_files)
             from blast_radius.import_state import import_all_sqlglot, module_digest
 
+            # Import everything, as the build did: importing only the owners builds different
+            # state for some of them (generators.duckdb), which would hide every narrowing.
             import_all_sqlglot()
             payload = marshal.dumps({name: module_digest(name) for name in names})
         except BaseException:
@@ -802,8 +804,8 @@ def _start_child_verification(
                 if not _mark(num, _run_candidate(num)):
                     break
 
-            # Step 2b: Makespan & worker-collapsing decapitation ordered tallest-first so
-            # larger ceilings are resolved before smaller targets beneath them are evaluated.
+            # Step 2b: Makespan & worker-collapsing decapitation, in the order the planner chose
+            # (tallest-first or cheapest-per-saved-ms first, whichever saved more).
             decap_ordered = [n for n in task.decap_targets if n in decap_set]
             for idx, num in enumerate(decap_ordered):
                 if failed and id_by_number[num] in TPC_SUITE_BY_TEST_ID and task.tpc_mode != "fast_a":
@@ -950,34 +952,40 @@ def plan_verification(
                 c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number)
                 if c_ms < sim_ms:
                     raw_decap.append((sim_ms, c_ms, num))
-            elif sim_ms >= 1000:
+            elif sim_ms >= 150:
                 c_ms = cpu_by_number[num]
-                if c_ms <= sim_ms * 0.78:
-                    raw_decap.append((sim_ms, c_ms, num))
-            elif sim_ms >= 180 and static_cost_ms >= 6000 and len(rem_verifiable) >= 10:
-                c_ms = cpu_by_number[num]
-                if c_ms <= sim_ms * 0.65:
+                if c_ms <= sim_ms * 0.85:
                     raw_decap.append((sim_ms, c_ms, num))
 
-        # Order decapitation targets tallest-first (-sim_ms, est_cpu_ms, num) and select
-        # the greedy prefix that maximizes net makespan / worker-count reduction.
-        raw_decap.sort(key=lambda item: (-item[0], item[1], item[2]))
-        chosen_decap: list[int] = []
+        # Pick the prefix with the best net makespan / worker-count reduction, trying two
+        # orders: tallest-first (knock down the ceiling) and cheapest-per-saved-ms first (so a
+        # nearly free test is not stuck behind expensive taller ones).
+        # Planning cost grows with candidates: keep the 30 with the largest possible saving.
+        raw_decap = sorted(raw_decap, key=lambda item: (item[1] - item[0], item[2]))[:30]
         cur_pool = chosen - lazy_pp_nums
         cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
-        acc_decap_cpu = 0
-        best_net = (static_cost_ms - cur_cost) - (15 if lazy_pp_nums else 0)
+        base_net =(static_cost_ms - cur_cost) - (15 if lazy_pp_nums else 0)
+        best_net = base_net
         best_prefix: list[int] = []
-        trial_pool = set(cur_pool)
-        for _sim_ms, c_ms, num in raw_decap:
-            trial_pool.discard(num)
-            acc_decap_cpu += c_ms
-            new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial_pool])
-            net = (static_cost_ms - new_cost) - acc_decap_cpu - (15 if lazy_pp_nums else 0)
-            chosen_decap.append(num)
-            if net >= best_net + 250:
-                best_net = net
-                best_prefix = list(chosen_decap)
+        orders = (
+            sorted(raw_decap, key=lambda item: (-item[0], item[1], item[2])),
+            sorted(raw_decap, key=lambda item: (item[1] / item[0], -item[0], item[2])),
+        )
+        for order in orders:
+            order_best, order_prefix = base_net, []
+            chosen_decap: list[int] = []
+            acc_decap_cpu = 0
+            trial_pool = set(cur_pool)
+            for _sim_ms, c_ms, num in order:
+                trial_pool.discard(num)
+                acc_decap_cpu += c_ms
+                new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial_pool])
+                net = (static_cost_ms - new_cost) - acc_decap_cpu - (15 if lazy_pp_nums else 0)
+                chosen_decap.append(num)
+                if net >= order_best + 250:
+                    order_best, order_prefix = net, list(chosen_decap)
+            if order_best > best_net:
+                best_net, best_prefix = order_best, order_prefix
 
         # Keep selected decap targets ordered tallest-first so dominant ceilings are knocked down first.
         decap_targets = list(best_prefix)

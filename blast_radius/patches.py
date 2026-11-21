@@ -12,6 +12,7 @@ class FilePatch:
         # Each hunk is (old_start, old_count, new_start, body_lines).
         self.hunks: list[tuple[int, int, int, list[str]]] = []
         self.unusual = False  # binary, mode change, rename, ...
+        self.binary = False
 
 
 def parse_patch(text: str) -> list[FilePatch]:
@@ -60,9 +61,9 @@ def parse_patch(text: str) -> list[FilePatch]:
                     raise Everything("malformed hunk")
                 body.append(hunk_line if hunk_line else " ")
             current.hunks.append((old_start, orig_old_count, new_start, body))
+        elif line.startswith(("Binary files", "GIT binary patch")):
+            current.unusual = current.binary = True
         elif line.startswith((
-            "Binary files",
-            "GIT binary patch",
             "old mode",
             "new mode",
             "rename from",

@@ -25,6 +25,8 @@ from blast_radius.scopes import (
 )
 
 SAFE_HOTPATCH_DECORATORS = frozenset({"staticmethod", "classmethod", "property"})
+# Files that configure how pytest runs every test.
+PYTEST_CONFIG_FILES = frozenset({"pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py"})
 
 
 @dataclass
@@ -222,6 +224,7 @@ class Selector:
         self._hit_pp_lazy: bool = False
         self._coarse_block: bool = False
         self._no_import_check: bool = False
+        self._no_verify: bool = False
         self._owner_checks: set[str] = set()
         self._state = marshal.loads(STATE_FILE.read_bytes()) if STATE_FILE.is_file() else None
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
@@ -255,6 +258,7 @@ class Selector:
             attr_targets: list[tuple[str, str, str, object]] | None = []
             self._hit_pp_lazy = False
             self._owner_checks = set()
+            self._no_verify = False
             for file_patch in files:
                 file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets = self.select_file_detailed(
                     file_patch, patched_files
@@ -290,11 +294,15 @@ class Selector:
                         coarse_mask |= fm
                 finally:
                     self._no_import_check = False
+                if self._no_verify:
+                    # The import check runs the patched code, which this commit cannot overlay.
+                    mask, owners, lazy_pp_mask = coarse_mask, [], 0
             reason = "noop" if all_noop and mask == 0 else "mapped"
             return Selection(
                 mask=mask,
                 reason=reason,
-                patched_files=patched_files,
+                # No patched files means no runtime verification (deleted/renamed/binary files).
+                patched_files={} if self._no_verify else patched_files,
                 hot_patch_targets=hot_targets,
                 attr_hot_targets=attr_targets,
                 fixture_only=all_fixture_or_noop and not all_noop,
@@ -326,9 +334,23 @@ class Selector:
         list[tuple[str, str, str, object]] | None,
     ]:
         impact = self.impact
-        if fp.unusual or fp.old is None or fp.new is None or fp.old != fp.new:
-            raise Everything("added, deleted, renamed or binary file")
+        if fp.binary or (fp.old is not None and fp.new is not None and fp.old != fp.new) or fp.new is None:
+            # Binary, renamed or deleted: the in-memory overlay cannot reproduce these, so this
+            # commit is not verified; select what imports or reads the old path (a module that
+            # is gone fails its importers like one that cannot import) and lists its folder.
+            self._no_verify = True
+            mask = 0
+            for p in {fp.old, fp.new} - {None}:
+                mask |= self._readers(p)
+                if p.endswith(".py") and p.startswith(("sqlglot/", "tests/")) and p == fp.old:
+                    mask |= impact.module_level(p)
+            return mask, False, False, None, None
         path = fp.new
+        if fp.old is None:
+            # New file: no pinned code imports or opens it; tests that list its folder may see it.
+            # The overlay serves it, so verification still works.
+            patched_files[path] = apply("", fp.hunks)
+            return self._readers(path), False, False, None, None
         if path.startswith("tests/fixtures/"):
             file = SOURCE / path
             if not file.is_file():
@@ -336,11 +358,21 @@ class Selector:
             old_text = file.read_text(encoding="utf-8")
             patched_files[path] = apply(old_text, fp.hunks)
             return self.select_fixture(path), False, True, [], []
+        if path in PYTEST_CONFIG_FILES:
+            raise Everything(f"pytest configuration {path}")
         if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
             if path.startswith("tests/") and (path.endswith("__init__.py") or path.endswith("conftest.py")):
-                raise Everything("test package plumbing")
+                # Package plumbing: a real change reaches every test collected under its folder.
+                py_mask, py_noop, new_text, _, _ = self.select_python_detailed(path, fp.hunks)
+                if py_noop:
+                    return 0, True, True, [], []
+                patched_files[path] = new_text
+                folder = path.rsplit("/", 1)[0] + "/"
+                under = sum(1 << i for i, t in enumerate(impact.test_ids) if t.startswith(folder))
+                return under | py_mask, False, False, None, None
             if path.startswith("sqlglot/") and path not in impact.lines and path not in impact.importers:
-                raise Everything(f"{path} unknown to the map")
+                # Never imported or run by any test: only tests that open the file can notice.
+                return self._readers(path), self._readers(path) == 0, False, [], []
             # Always include tests that directly opened this .py file (e.g. test_typing.py),
             # except when a sqlglot/typing/*.py change is a pure comment or AST-identical noop
             # (test_no_redundant_expression_metadata only inspects AST imports and EXPRESSION_METADATA).
@@ -351,21 +383,30 @@ class Selector:
             if not py_noop or readers:
                 patched_files[path] = new_text
             return readers | py_mask, py_noop and readers == 0, py_noop, targets, attr_targets
-        raise Everything(f"unmapped path {path}")
+        # Docs, packaging, CI config, the Rust tokenizer (not installed) ...: only tests that
+        # open the file or list its folder can notice a change.
+        readers = self._readers(path)
+        if readers:
+            file = SOURCE / path
+            if not file.is_file():
+                raise Everything(f"no pinned source for {path}")
+            patched_files[path] = apply(file.read_text(encoding="utf-8"), fp.hunks)
+        return readers, readers == 0, readers == 0, [], []
 
-    def select_fixture(self, path: str) -> int:
+    def _readers(self, path: str) -> int:
+        """Tests that opened the file or listed its folder in the pinned run."""
         impact = self.impact
         mask = 0
-        index = impact.paths.get("f:" + path)
-        if index is not None:
-            mask |= impact.mask(index)
-        folder = path.rsplit("/", 1)[0]
-        index = impact.paths.get("d:" + folder)
-        if index is not None:
-            mask |= impact.mask(index)
-        if not mask:
-            raise Everything(f"no test reads {path}")
+        folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        for key in ("f:" + path, "d:" + folder):
+            index = impact.paths.get(key)
+            if index is not None:
+                mask |= impact.mask(index)
         return mask
+
+    def select_fixture(self, path: str) -> int:
+        # A fixture no test opened (nor listed its folder) cannot change any test's outcome.
+        return self._readers(path)
 
     def select_python_detailed(
         self,
@@ -388,7 +429,8 @@ class Selector:
             new_tree = ast.parse(new_text)
             compile(new_tree, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
-            raise Everything(f"{path} no longer compiles")
+            # The module cannot import: exactly what an import-time change reaches fails.
+            return self.impact.module_level(path), False, new_text, None, None
         new_scopes = Scopes(new_tree, has_lambda="lambda" in new_text)
 
         # Normalized AST equivalence catches quote/paren/wrapping refactors, TYPE_CHECKING-only

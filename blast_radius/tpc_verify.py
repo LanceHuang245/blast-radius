@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 import pickle
+import time
 
 from blast_radius.precompile_tpc import (
     TPC_META_FILE,
@@ -52,6 +53,10 @@ TPC_EST_CPU_MS = {
     ("tpch", "full_cached"): 2000,
 }
 
+# fast_a re-executes queries whose optimized plan changed; beyond these it keeps the test instead.
+TPC_REEXEC_MAX_QUERIES = 40
+TPC_REEXEC_BUDGET_S = 10.0
+
 _meta_cache: dict | None = None
 
 
@@ -63,6 +68,7 @@ def load_tpc_meta() -> dict | None:
         _meta_cache = {
             "stage1_funcs": set(tuple(x) for x in raw["stage1_funcs"]),
             "stage2b_funcs": set(tuple(x) for x in raw["stage2b_funcs"]),
+            "stage2b_files": {x[0] for x in raw["stage2b_funcs"]},
             "opt_tpch_pairs": raw.get("opt_tpch_pairs"),
         }
     return _meta_cache
@@ -94,6 +100,12 @@ def select_tpc_mode(sel: Selection) -> str | None:
             return "fast_a"
         if touches_s2b and not touches_s1 and all_accounted:
             return "fast_b"
+
+    # Any edit (class attributes, module level, several files) outside every file that runs code
+    # in Stage 2b leaves Stage 2b's code unchanged; fast_a checks its inputs (re-executing the
+    # queries whose plans changed).
+    if all(p.startswith("sqlglot/") and p not in meta["stage2b_files"] for p in sel.patched_files):
+        return "fast_a"
 
     return "full_cached"
 
@@ -190,6 +202,7 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
         # A query whose optimized AST or plan changed may still return the same rows, which is all
         # the real test checks: execute just that query (with the patched executor) and compare.
         duck_changed: list[tuple[str, str]] = []
+        reexec: list[tuple[int, str]] = []
         for index, q in enumerate(s1["queries"]):
             expr = parse_one(q["sql"])
             if not q["execute"]:
@@ -202,15 +215,25 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
             opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
             if serde_dump(opt_expr) == q["opt_dump"] and plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]:
                 continue
-            if not same_rows_as_pinned(index, q["sql"]):
-                return False
+            reexec.append((index, q["sql"]))
 
         # Stage 2a: Python().generator codegen parity on every expression generated during execution.
         py_gen = Python().generator(identify=True, comments=False)
         for expr_dump, expected_py in s1["gen_pairs"]:
             if py_gen.generate(serde_load(expr_dump)) != expected_py:
                 return False
-        return not duck_changed or _same_duckdb_results(suite_name, duck_changed)
+
+        # Re-executing changed queries costs CPU close to what dropping the test saves: give up
+        # (keeping the test) when many changed or the budget runs out.
+        if len(reexec) > TPC_REEXEC_MAX_QUERIES:
+            return False
+        if duck_changed and not _same_duckdb_results(suite_name, duck_changed):
+            return False
+        start = time.process_time()
+        for index, sql in reexec:
+            if time.process_time() - start > TPC_REEXEC_BUDGET_S or not same_rows_as_pinned(index, sql):
+                return False
+        return True
 
 
     with open(TPC_STAGE2_FILE, "rb") as handle:

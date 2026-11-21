@@ -28,8 +28,9 @@ def main() -> None:
     ms_by_number = {t["number"]: round(t["seconds"] * 1000) for t in tests}
 
     impact = ImpactMap(MAP_FILE)
+    # Uncalibrated tests: in-process CPU is ~1.3x the recorded seconds (median of calibrated ones).
     cpu_by_number = {
-        t["number"]: impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 1000)) for t in tests
+        t["number"]: impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 1300)) for t in tests
     }
     selector = Selector(impact)
     numbers = [number_by_id.get(test_id) for test_id in impact.test_ids]
