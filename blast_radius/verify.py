@@ -1,4 +1,4 @@
-"""Dual-phase forked runtime verifier with cost-aware early stopping.
+"""Dual-phase forked runtime verifier with real-CPU makespan decapitation and 2-core parallelism.
 
 Phase 1 (Clean Fork, before parent imports sqlglot):
     Verifies commits that touch class/module-level code, closures, or test files
@@ -6,7 +6,7 @@ Phase 1 (Clean Fork, before parent imports sqlglot):
 
 Phase 2 (Pre-Warmed Fork, after parent imports sqlglot once):
     Verifies commits that only modify existing non-nested function bodies via
-    in-place __code__ replacement, and pure fixture edits via virtual open().
+    in-place __code__ replacement, and safe literal class-attribute updates.
     Test modules are lazily pre-imported once in the parent and shared via COW.
 
 Soundness invariant: a candidate test is dropped ONLY if it explicitly ran and
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import builtins
 import concurrent.futures as cf
+import gc
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -33,7 +34,7 @@ import time
 import types
 import unittest
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from blast_radius import SOURCE, log
 from blast_radius.impact_map import module_name
@@ -43,6 +44,10 @@ from blast_radius.tpc_verify import (
     TPC_EST_CPU_MS,
     TPC_SUITE_BY_TEST_ID,
     select_tpc_mode,
+    verify_generator_memory,
+    verify_lazy_athena_presto,
+    verify_max_nodes,
+    verify_optimized_tpch,
     verify_tpc_test,
 )
 
@@ -50,22 +55,28 @@ from blast_radius.tpc_verify import (
 MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "2500"))
 MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "2500"))
 MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "350"))
+MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "600"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
-TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "90000"))
+TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "95000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
 ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
 ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
 TPC_PROBE_BUDGET_MS = int(os.environ.get("BR_TPC_PROBE_MS", "300"))
-TPC_MIN_GAIN_MS = int(os.environ.get("BR_TPC_MIN_GAIN_MS", "2000"))
+TPC_MIN_GAIN_MS = int(os.environ.get("BR_TPC_MIN_GAIN_MS", "1800"))
+MAX_PARALLEL_CHILDREN = int(os.environ.get("BR_PARALLEL", "2"))
 
 # Hard wall-clock limits, enforced by the parent (the run itself has 3 minutes, 4.5 in the final).
-CHILD_LIMIT_BASE_S = 5.0  # per child: base + factor x estimated CPU
+CHILD_LIMIT_BASE_S = 5.0
 CHILD_LIMIT_FACTOR = 3.0
-VERIFY_WALL_BUDGET_S = float(os.environ.get("BR_VERIFY_WALL_S", "120"))
+VERIFY_WALL_BUDGET_S = float(os.environ.get("BR_VERIFY_WALL_S", "130"))
 
-# Tests in TestExecutor that actually use numpy/pandas/TPC fixtures.
+OPT_TPCH_TEST_ID = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+MAX_NODES_TEST_ID = "tests/test_parser.py::TestParser::test_max_nodes"
+GEN_MEM_TEST_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
+
+# Tests in TestExecutor that actually use numpy/pandas/TPC fixtures when run via real unittest.
 TPC_EXECUTOR_TESTS = frozenset({
-    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+    OPT_TPCH_TEST_ID,
     "tests/test_executor.py::TestExecutor::test_execute_tpch",
     "tests/test_executor.py::TestExecutor::test_execute_tpcds",
 })
@@ -77,7 +88,8 @@ FRESH_IMPORT_TESTS = frozenset({
     "tests/test_dialect_imports.py::TestDialectImports::test_dialect_import_no_deadlock",
 })
 
-# Tests that spawn a fresh Python interpreter against disk cannot see an in-memory overlay.
+# Tests that spawn a fresh Python interpreter against disk cannot see an in-memory overlay;
+# we keep this individual test unverified while still verifying/decapitating its sibling tests.
 SUBPROCESS_TESTS = frozenset({
     "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
 })
@@ -103,6 +115,33 @@ class VerifyTask:
     est_cpu_ms: int
     expected_gain_ms: int = 0
     tpc_mode: str | None = None
+    lazy_pp_nums: set[int] = field(default_factory=set)
+    decap_targets: list[int] = field(default_factory=list)
+
+
+class _LazyFuture(cf.Future):
+    """Evaluates submitted work on .result() so fail-fast subtests abort before running remaining queries."""
+
+    def __init__(self, fn, args, kwargs):
+        super().__init__()
+        self._work = (fn, args, kwargs)
+        self._evaluated = False
+
+    def _evaluate(self) -> None:
+        if self._evaluated:
+            return
+        self._evaluated = True
+        fn, args, kwargs = self._work
+        self._work = None
+        try:
+            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+            self.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+        except BaseException as error:
+            self.set_exception(error)
+
+    def result(self, timeout=None):
+        self._evaluate()
+        return super().result(timeout=timeout)
 
 
 class _InProcessExecutor:
@@ -110,24 +149,23 @@ class _InProcessExecutor:
 
     Arguments and results still go through pickle, as they would to a spawned worker:
     sqlglot expressions pickle through serde (Expression.__reduce__), so a patch that
-    breaks serialization must fail here too.
+    breaks serialization must fail here too. Lazy evaluation on .result() lets
+    TestOptimizer.check_file abort on the first failing query instead of running all 500.
     """
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
         if initializer is not None:
             initializer(*pickle.loads(pickle.dumps(initargs)))
+        self._futures: list[_LazyFuture] = []
 
     def submit(self, fn, /, *args, **kwargs):
-        future: cf.Future = cf.Future()
-        try:
-            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
-            future.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
-        except BaseException as error:
-            future.set_exception(error)
-        return future
+        fut = _LazyFuture(fn, args, kwargs)
+        self._futures.append(fut)
+        return fut
 
     def map(self, fn, *iterables, timeout=None, chunksize=1):
-        return [self.submit(fn, *args).result() for args in zip(*iterables)]
+        futs = [self.submit(fn, *args) for args in zip(*iterables)]
+        return [f.result() for f in futs]
 
     def shutdown(self, wait=True, *, cancel_futures=False):
         pass
@@ -135,8 +173,21 @@ class _InProcessExecutor:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type, *exc):
+        if exc_type is None:
+            for fut in self._futures:
+                if not fut._evaluated:
+                    fut._evaluate()
+        self._futures.clear()
         return False
+
+
+def _lazy_wait(fs, timeout=None, return_when=cf.ALL_COMPLETED):
+    return set(fs), set()
+
+
+def _lazy_as_completed(fs, timeout=None):
+    return iter(fs)
 
 
 class _OverlayLoader(importlib.abc.Loader):
@@ -316,8 +367,8 @@ def _install_lazy_executor_setup(cls: type) -> None:
 def _install_lazy_data_libs() -> None:
     """Defer importing numpy and pandas until actually accessed by a test.
 
-    tests/test_executor.py imports numpy and pandas at module top level only for
-    its 3 TPC-H/TPC-DS tests; the other 57 TestExecutor unit tests never touch them.
+    Both tests/test_executor.py and tests/test_optimizer.py import pandas.testing
+    at module top level, even though most tests never call assert_frame_equal.
     """
     if "numpy" in sys.modules or "pandas" in sys.modules:
         return
@@ -330,14 +381,15 @@ def _install_lazy_data_libs() -> None:
             if getattr(mod, "_br_lazy_stub", False):
                 sys.modules.pop(s, None)
         real = importlib.import_module(name)
-        exec_mod = sys.modules.get("tests.test_executor")
-        if exec_mod is not None:
-            if name == "numpy" and getattr(getattr(exec_mod, "np", None), "_br_lazy_stub", False):
-                exec_mod.np = real
-            elif name == "pandas" and getattr(getattr(exec_mod, "pd", None), "_br_lazy_stub", False):
-                exec_mod.pd = real
-            elif name == "pandas.testing":
-                exec_mod.assert_frame_equal = real.assert_frame_equal
+        for mod_key in ("tests.test_executor", "tests.test_optimizer"):
+            tmod = sys.modules.get(mod_key)
+            if tmod is not None:
+                if name == "numpy" and getattr(getattr(tmod, "np", None), "_br_lazy_stub", False):
+                    tmod.np = real
+                elif name == "pandas" and getattr(getattr(tmod, "pd", None), "_br_lazy_stub", False):
+                    tmod.pd = real
+                elif name == "pandas.testing":
+                    tmod.assert_frame_equal = real.assert_frame_equal
         return real
 
     class _LazyModule(types.ModuleType):
@@ -361,12 +413,18 @@ def _install_lazy_data_libs() -> None:
 
 
 def _patch_pool_references() -> None:
-    """Ensure both concurrent.futures and already-imported test modules use _InProcessExecutor."""
+    """Ensure concurrent.futures and imported test modules use lazy fail-fast _InProcessExecutor."""
     cf.ProcessPoolExecutor = _InProcessExecutor
     for mod_name in ("tests.test_optimizer", "tests.test_executor"):
         mod = sys.modules.get(mod_name)
-        if mod is not None and hasattr(mod, "ProcessPoolExecutor"):
-            setattr(mod, "ProcessPoolExecutor", _InProcessExecutor)
+        if mod is not None:
+            if hasattr(mod, "ProcessPoolExecutor"):
+                setattr(mod, "ProcessPoolExecutor", _InProcessExecutor)
+            if mod_name == "tests.test_optimizer":
+                setattr(mod, "wait", _lazy_wait)
+                setattr(mod, "as_completed", _lazy_as_completed)
+
+
 def _install_fail_fast_subtest() -> None:
     """Abort a test immediately on the first failing subtest (while honoring SkipTest)."""
 
@@ -380,325 +438,524 @@ def _install_fail_fast_subtest() -> None:
     unittest.TestCase.subTest = _ff_subtest
 
 
+def _can_fast_opt_tpch(sel: Selection) -> bool:
+    return not any(
+        p in ("tests/test_executor.py", "tests/helpers.py") or p.startswith("tests/fixtures/")
+        for p in sel.patched_files
+    )
+
+
+def _can_fast_max_nodes(sel: Selection) -> bool:
+    return "tests/test_parser.py" not in sel.patched_files
+
+
+def _can_fast_gen_mem(sel: Selection) -> tuple[bool, bool]:
+    """Return (can_fast, is_scoped_only)."""
+    if "tests/test_generator.py" in sel.patched_files:
+        return False, False
+    core_touched = any(
+        not p.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/"))
+        or p in (
+            "sqlglot/dialects/dialect.py",
+            "sqlglot/dialects/__init__.py",
+            "sqlglot/generators/__init__.py",
+            "sqlglot/parsers/base.py",
+            "sqlglot/typing/__init__.py",
+        )
+        for p in sel.patched_files
+    )
+    return True, not core_touched
+
+
+def _est_test_cpu_ms(
+    num: int,
+    tid: str,
+    sel: Selection,
+    tpc_mode: str | None,
+    cpu_by_number: dict[int, int],
+) -> int:
+    """Return best realistic CPU estimate (ms) for verifying test `num` on `sel`."""
+    if tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
+        return TPC_EST_CPU_MS[(TPC_SUITE_BY_TEST_ID[tid], tpc_mode)]
+    if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
+        return 100
+    if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
+        tok_touched = any(
+            p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/dialect.py")
+            for p in sel.patched_files
+        )
+        return 16500 if tok_touched else 11800
+    if tid == GEN_MEM_TEST_ID:
+        can_fast, is_scoped = _can_fast_gen_mem(sel)
+        if can_fast and is_scoped:
+            return 550
+    return cpu_by_number[num]
+
+
 def _should_continue_after_failure(
     failed: set[int],
     unverified: set[int],
     ms_by_number: dict[int, int],
+    cpu_by_number: dict[int, int],
 ) -> bool:
-    """Only continue running tests after a failure if dropping them can save strictly more than CPU."""
+    """Only continue running tests after a failure if dropping them saves strictly more than real CPU."""
     if not unverified:
         return False
     cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in (failed | unverified)])
     only_fail_cost, _ = split_with_cost([(ms_by_number[n], n) for n in failed])
     max_possible_savings = cur_cost - only_fail_cost
-    rem_cpu = sum(ms_by_number[n] for n in unverified)
-    # Profitable mainly when dropping unverified tests removes a 2s worker overhead.
+    rem_cpu = sum(cpu_by_number[n] for n in unverified)
     return max_possible_savings >= 1500 and rem_cpu < max_possible_savings * 0.65
 
 
-def _run_child_verification(
+def _start_child_verification(
     task: VerifyTask,
     id_by_number: dict[int, str],
     ms_by_number: dict[int, int],
+    cpu_by_number: dict[int, int],
     out_fd: int | None,
-    limit_s: float,
-) -> set[int]:
-    """Fork an isolated child to verify candidate tests; return the pruned test-number set."""
+) -> tuple[int, int]:
+    """Fork an isolated child to verify candidate tests; return (pid, read_pipe_fd)."""
     r_fd, w_fd = os.pipe()
     pid = os.fork()
-    if pid == 0:
-        os.close(r_fd)
-        if out_fd is not None:
-            try:
-                os.close(out_fd)
-            except OSError:
-                pass
+    if pid != 0:
+        os.close(w_fd)
+        return pid, r_fd
+
+    os.close(r_fd)
+    if out_fd is not None:
         try:
-            os.chdir(SOURCE)
-            if str(SOURCE) not in sys.path:
-                sys.path.insert(0, str(SOURCE))
-            _patch_pool_references()
-            _install_fail_fast_subtest()
+            os.close(out_fd)
+        except OSError:
+            pass
+    try:
+        gc.enable()
+        os.chdir(SOURCE)
+        if str(SOURCE) not in sys.path:
+            sys.path.insert(0, str(SOURCE))
+        _patch_pool_references()
+        _install_fail_fast_subtest()
 
-            if task.phase == 1:
-                sys.meta_path.insert(0, _OverlayFinder(task.selection.patched_files))
-                _install_open_overlay(task.selection.patched_files)
-            else:
-                _install_open_overlay(task.selection.patched_files)
-                if task.selection.hot_patch_targets:
-                    if not _apply_code_hotpatch(task.selection.patched_files, task.selection.hot_patch_targets):
-                        os.write(w_fd, b"FAIL_PATCH")
-                        os.close(w_fd)
-                        os._exit(0)
-                if task.selection.attr_hot_targets:
-                    if not _apply_attr_hotpatch(task.selection.attr_hot_targets):
-                        os.write(w_fd, b"FAIL_PATCH")
-                        os.close(w_fd)
-                        os._exit(0)
+        if task.phase == 1:
+            if "sqlglot" in sys.modules:
+                for k in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests."))]:
+                    sys.modules.pop(k, None)
+            sys.meta_path.insert(0, _OverlayFinder(task.selection.patched_files))
+            _install_open_overlay(task.selection.patched_files)
+        else:
+            _install_open_overlay(task.selection.patched_files)
+            if task.selection.hot_patch_targets:
+                if not _apply_code_hotpatch(task.selection.patched_files, task.selection.hot_patch_targets):
+                    os.write(w_fd, b"FAIL_PATCH")
+                    os.close(w_fd)
+                    os._exit(0)
+            if task.selection.attr_hot_targets:
+                if not _apply_attr_hotpatch(task.selection.attr_hot_targets):
+                    os.write(w_fd, b"FAIL_PATCH")
+                    os.close(w_fd)
+                    os._exit(0)
 
-            def _alarm_handler(_signum, _frame):
-                raise TimeoutError("test timed out")
+        def _alarm_handler(_signum, _frame):
+            raise TimeoutError("test timed out")
 
-            signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.signal(signal.SIGALRM, _alarm_handler)
 
-            failed: set[int] = set()
-            passed: set[int] = set()
-            loaded_classes: dict[tuple[str, str], type] = {}
-            setup_done: set[type] = set()
-            executor_patched = "tests/test_executor.py" in task.selection.patched_files
-            needs_real_tpc = any(
-                id_by_number[n] in TPC_EXECUTOR_TESTS
-                and not (task.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
-                for n in task.chosen
+        failed: set[int] = set()
+        passed: set[int] = set()
+        loaded_classes: dict[tuple[str, str], type] = {}
+        setup_done: set[type] = set()
+        sel = task.selection
+        executor_patched = "tests/test_executor.py" in sel.patched_files
+        needs_real_tpc = any(
+            (
+                id_by_number[n] in TPC_SUITE_BY_TEST_ID and not task.tpc_mode
             )
-            if not executor_patched and not needs_real_tpc:
-                _install_lazy_data_libs()
+            or (
+                id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(sel)
+            )
+            for n in task.chosen
+        )
+        if not executor_patched and not needs_real_tpc:
+            _install_lazy_data_libs()
 
-            def _run_unittest(num: int) -> bool:
-                tid = id_by_number[num]
-                parts = tid.split("::")
-                if len(parts) != 3:
-                    return False
-                file_path, cls_name, meth_name = parts
-                mod_name = file_path[:-3].replace("/", ".")
-                key = (mod_name, cls_name)
+        def _run_unittest(num: int) -> bool:
+            tid = id_by_number[num]
+            parts = tid.split("::")
+            if len(parts) != 3:
+                return False
+            file_path, cls_name, meth_name = parts
+            mod_name = file_path[:-3].replace("/", ".")
+            key = (mod_name, cls_name)
 
+            ok = False
+            est_s = max(ms_by_number[num], cpu_by_number[num]) / 1000
+            timeout_s = max(5, int(est_s * 5) + 4)
+            signal.alarm(timeout_s)
+            try:
+                if key not in loaded_classes:
+                    mod = importlib.import_module(mod_name)
+                    if mod_name in ("tests.test_optimizer", "tests.test_executor"):
+                        _patch_pool_references()
+                    cls = getattr(mod, cls_name)
+                    if cls_name == "TestExecutor" and not executor_patched:
+                        _install_lazy_executor_setup(cls)
+                    loaded_classes[key] = cls
+                    if cls not in setup_done:
+                        cls.setUpClass()
+                        setup_done.add(cls)
+                cls = loaded_classes[key]
+                res = unittest.TestResult()
+                cls(meth_name).run(res)
+                ok = res.wasSuccessful()
+            except BaseException:
                 ok = False
-                timeout_s = max(5, int(ms_by_number[num] / 1000 * 5) + 4)
-                signal.alarm(timeout_s)
+            finally:
+                signal.alarm(0)
+            return ok
+
+        def _run_candidate(num: int) -> bool:
+            tid = id_by_number[num]
+            if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
+                signal.alarm(65)
                 try:
-                    if key not in loaded_classes:
-                        mod = importlib.import_module(mod_name)
-                        cls = getattr(mod, cls_name)
-                        if cls_name == "TestExecutor" and not executor_patched:
-                            _install_lazy_executor_setup(cls)
-                        loaded_classes[key] = cls
-                        if cls not in setup_done:
-                            cls.setUpClass()
-                            setup_done.add(cls)
-                    cls = loaded_classes[key]
-                    res = unittest.TestResult()
-                    cls(meth_name).run(res)
-                    ok = res.wasSuccessful()
+                    return verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode)
                 except BaseException:
-                    ok = False
+                    return False
                 finally:
                     signal.alarm(0)
-                return ok
+            if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
+                signal.alarm(15)
+                try:
+                    return verify_optimized_tpch(sel.patched_files)
+                except BaseException:
+                    return False
+                finally:
+                    signal.alarm(0)
+            if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
+                signal.alarm(60)
+                try:
+                    return verify_max_nodes(sel.patched_files)
+                except BaseException:
+                    return False
+                finally:
+                    signal.alarm(0)
+            if tid == GEN_MEM_TEST_ID:
+                can_fast, is_scoped = _can_fast_gen_mem(sel)
+                if can_fast and is_scoped:
+                    signal.alarm(25)
+                    try:
+                        return verify_generator_memory(sel.patched_files, scoped_only=True)
+                    except BaseException:
+                        return False
+                    finally:
+                        signal.alarm(0)
+            return _run_unittest(num)
 
-            if task.tpc_mode:
-                # TPC execution order: cheap fail-fast probe -> cached TPC -> cost-gated tail.
-                other_ordered = sorted(
-                    (n for n in task.chosen if id_by_number[n] not in TPC_SUITE_BY_TEST_ID),
-                    key=lambda n: (ms_by_number[n], id_by_number[n]),
+        # Step 1: If pushdown_predicates.py:36-37 lazy imports inflated `chosen`, verify clean import in ~10ms.
+        if task.lazy_pp_nums:
+            ok_lazy = False
+            signal.alarm(10)
+            try:
+                ok_lazy = verify_lazy_athena_presto(sel.patched_files)
+            except BaseException:
+                ok_lazy = False
+            finally:
+                signal.alarm(0)
+            if ok_lazy:
+                passed.update(task.lazy_pp_nums)
+
+        verifiable = {
+            n for n in (task.chosen - passed) if id_by_number[n] not in SUBPROCESS_TESTS
+        }
+        decap_set = set(task.decap_targets) & verifiable
+
+        if decap_set:
+            total_decap_cpu = sum(
+                _est_test_cpu_ms(n, id_by_number[n], sel, task.tpc_mode, cpu_by_number)
+                for n in decap_set
+            )
+            other_rem = verifiable - decap_set
+            other_cpus = [cpu_by_number[n] for n in other_rem]
+            will_verify_tail = (
+                bool(other_rem)
+                and max(other_cpus) <= MAX_SINGLE_TEST_MS
+                and sum(other_cpus) <= MAX_COMMIT_VERIFY_MS
+            )
+            # Only run a pre-decap fail-fast probe when decap targets are expensive (>= 1.5s)
+            # or when the remaining tail is small enough to verify completely.
+            need_probe = total_decap_cpu >= 1500 or will_verify_tail
+            other_ordered = sorted(
+                other_rem,
+                key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+            )
+            probe_tests: list[int] = []
+            tail_tests: list[int] = []
+            probe_cpu = 0
+            for num in other_ordered:
+                c_ms = cpu_by_number[num]
+                if need_probe and c_ms <= 450 and probe_cpu + c_ms <= TPC_PROBE_BUDGET_MS:
+                    probe_tests.append(num)
+                    probe_cpu += c_ms
+                else:
+                    tail_tests.append(num)
+
+            # Step 2a: Fail-fast probe on cheap unit tests.
+            for num in probe_tests:
+                if _run_candidate(num):
+                    passed.add(num)
+                else:
+                    failed.add(num)
+                    break
+
+            # Step 2b: Makespan decapitation on heavy bottleneck tests (even after probe failure
+            # for ultra-high-ROI non-TPC verifiers like opt_tpch, gen_mem, canonicalize, max_nodes).
+            decap_ordered = [n for n in task.decap_targets if n in decap_set]
+            rem_decap = list(decap_ordered)
+            for idx, num in enumerate(decap_ordered):
+                rem_decap = decap_ordered[idx:]
+                tid = id_by_number[num]
+                t_cpu = _est_test_cpu_ms(num, tid, sel, task.tpc_mode, cpu_by_number)
+                if failed:
+                    # Do not spend heavy TPC CPU once a unit probe already failed on this commit.
+                    if tid in TPC_SUITE_BY_TEST_ID:
+                        continue
+                    # For non-TPC decap targets after a probe failure, require strong standalone ROI.
+                    cur_pool = task.chosen - passed
+                    cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
+                    without_c, _ = split_with_cost([(ms_by_number[n], n) for n in (cur_pool - {num})])
+                    if (cur_c - without_c) - t_cpu < MIN_DECAP_GAIN_MS:
+                        continue
+                else:
+                    # Check joint remaining decapitation ROI against current pool.
+                    cur_pool = task.chosen - passed
+                    cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
+                    without_rem_c, _ = split_with_cost(
+                        [(ms_by_number[n], n) for n in (cur_pool - set(rem_decap))]
+                    )
+                    rem_cpu = sum(
+                        _est_test_cpu_ms(x, id_by_number[x], sel, task.tpc_mode, cpu_by_number)
+                        for x in rem_decap
+                    )
+                    if (cur_c - without_rem_c) - rem_cpu < MIN_GAIN_MS:
+                        continue
+
+                if _run_candidate(num):
+                    passed.add(num)
+                else:
+                    failed.add(num)
+
+            # Step 2c: If no failures so far, verify remaining tail if dropping it beats its real CPU.
+            if not failed and tail_tests:
+                tail_cpus = [cpu_by_number[n] for n in tail_tests]
+                cur_pool = task.chosen - passed
+                cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
+                after_tail_c, _ = split_with_cost(
+                    [(ms_by_number[n], n) for n in (cur_pool - set(tail_tests))]
                 )
-                tpc_ordered = sorted(
-                    (n for n in task.chosen if id_by_number[n] in TPC_SUITE_BY_TEST_ID),
-                    key=lambda n: (ms_by_number[n], id_by_number[n]),
-                )
-                probe_tests: list[int] = []
-                tail_tests: list[int] = []
-                probe_ms = 0
-                for num in other_ordered:
-                    dur = ms_by_number[num]
-                    if (
-                        id_by_number[num] not in SUBPROCESS_TESTS
-                        and dur <= MAX_SINGLE_TEST_MS
-                        and probe_ms + dur <= TPC_PROBE_BUDGET_MS
-                    ):
-                        probe_tests.append(num)
-                        probe_ms += dur
-                    else:
-                        tail_tests.append(num)
-
-                # Step A: fail-fast probe catches real bugs in ~0.05-0.3s before spending TPC CPU.
-                for num in probe_tests:
-                    if _run_unittest(num):
-                        passed.add(num)
-                    else:
-                        failed.add(num)
-                        break
-
-                # Step B: verify TPC test(s) via exact cached two-stage verifier.
-                if not failed:
-                    for num in tpc_ordered:
-                        tid = id_by_number[num]
-                        ok = False
-                        signal.alarm(60)
-                        try:
-                            ok = verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode)
-                        except BaseException:
-                            ok = False
-                        finally:
-                            signal.alarm(0)
-                        if ok:
+                if (
+                    max(tail_cpus) <= MAX_SINGLE_TEST_MS
+                    and sum(tail_cpus) <= MAX_COMMIT_VERIFY_MS
+                    and (cur_c - after_tail_c) - sum(tail_cpus) >= MIN_GAIN_MS
+                ):
+                    unverified = set(tail_tests)
+                    for num in tail_tests:
+                        if failed and not _should_continue_after_failure(
+                            failed, unverified, ms_by_number, cpu_by_number
+                        ):
+                            break
+                        unverified.discard(num)
+                        if _run_candidate(num):
                             passed.add(num)
                         else:
                             failed.add(num)
-                            break
-
-                # Step C: only verify remaining non-TPC tail if dropping it beats its CPU cost.
-                if not failed and tail_tests:
-                    tail_durs = [ms_by_number[n] for n in tail_tests]
-                    tail_sim, _ = split_with_cost([(ms_by_number[n], n) for n in tail_tests])
-                    if (
-                        max(tail_durs) <= MAX_SINGLE_TEST_MS
-                        and sum(tail_durs) <= MAX_COMMIT_VERIFY_MS
-                        and tail_sim - sum(tail_durs) >= MIN_GAIN_MS
-                    ):
-                        unverified = set(tail_tests)
-                        for num in tail_tests:
-                            if id_by_number[num] in SUBPROCESS_TESTS:
-                                continue
-                            if failed and not _should_continue_after_failure(failed, unverified, ms_by_number):
-                                break
-                            unverified.discard(num)
-                            if _run_unittest(num):
-                                passed.add(num)
-                            else:
-                                failed.add(num)
-            else:
-                ordered = sorted(task.chosen, key=lambda n: (ms_by_number[n], id_by_number[n]))
-                unverified: set[int] = set(ordered)
+        elif verifiable:
+            rem_cpus = [cpu_by_number[n] for n in verifiable]
+            if not task.lazy_pp_nums or (
+                max(rem_cpus) <= MAX_SINGLE_TEST_MS and sum(rem_cpus) <= MAX_COMMIT_VERIFY_MS
+            ):
+                ordered = sorted(
+                    verifiable,
+                    key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+                )
+                unverified = set(ordered)
                 for num in ordered:
-                    if id_by_number[num] in SUBPROCESS_TESTS:
-                        continue
-                    if failed and not _should_continue_after_failure(failed, unverified, ms_by_number):
+                    if failed and not _should_continue_after_failure(
+                        failed, unverified, ms_by_number, cpu_by_number
+                    ):
                         break
                     unverified.discard(num)
-                    if _run_unittest(num):
+                    if _run_candidate(num):
                         passed.add(num)
                     else:
                         failed.add(num)
 
-            payload = json.dumps({"passed": sorted(passed), "failed": sorted(failed)}).encode("utf-8")
-            os.write(w_fd, payload)
-        except BaseException:
-            pass
-        finally:
-            try:
-                os.close(w_fd)
-            except OSError:
-                pass
-            os._exit(0)
-
-    # Parent: read the pipe until the child finishes or its deadline passes. A per-test
-    # SIGALRM cannot interrupt a hang inside C code or a deadlock, so the parent enforces
-    # a hard limit and kills the child; its commit then keeps the static selection.
-    os.close(w_fd)
-    chunks: list[bytes] = []
-    deadline = time.monotonic() + limit_s
-    timed_out = False
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            timed_out = True
-            break
-        ready, _, _ = select.select([r_fd], [], [], remaining)
-        if not ready:
-            continue
-        chunk = os.read(r_fd, 65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    os.close(r_fd)
-    if timed_out:
+        payload = json.dumps({"passed": sorted(passed), "failed": sorted(failed)}).encode("utf-8")
+        os.write(w_fd, payload)
+    except BaseException:
+        pass
+    finally:
         try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+            os.close(w_fd)
+        except OSError:
             pass
-    _, status, rusage = os.wait4(pid, 0)
-    if timed_out:
-        log(f"{task.commit}: verify killed after {limit_s:.1f}s p{task.phase}")
-        return task.chosen
-    child_cpu = rusage.ru_utime + rusage.ru_stime
-    raw = b"".join(chunks)
-    if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0 or not raw or raw == b"FAIL_PATCH":
-        log(f"{task.commit}: verify fallback p{task.phase} ({child_cpu:.3f}s, status={status})")
-        return task.chosen
-
-    try:
-        data = json.loads(raw)
-        passed_set = set(data["passed"])
-        mtag = f" tpc={task.tpc_mode}" if task.tpc_mode else ""
-        log(
-            f"{task.commit}: p{task.phase}{mtag} cpu={child_cpu:.3f}s "
-            f"pass={len(passed_set)} fail={len(data['failed'])}/{len(task.chosen)}"
-        )
-        # Soundness: only drop tests that explicitly passed; retain everything else.
-        return task.chosen - passed_set
-    except Exception:
-        return task.chosen
+        os._exit(0)
 
 
 def plan_verification(
     commits: list[tuple[str, set[int], Selection]],
     id_by_number: dict[int, str],
     ms_by_number: dict[int, int],
+    cpu_by_number: dict[int, int],
+    number_by_index: list[int | None] | None = None,
 ) -> tuple[list[VerifyTask], list[VerifyTask]]:
-    """Select and prioritize commits worth runtime verification within a deterministic budget."""
+    """Select and prioritize commits worth runtime verification or makespan decapitation."""
     candidates: list[VerifyTask] = []
     for commit, chosen, sel in commits:
         if not chosen or not sel.patched_files or sel.reason.startswith("everything"):
             continue
         tids = [id_by_number[n] for n in chosen]
-        if any(tid in SUBPROCESS_TESTS for tid in tids):
+        verifiable = {n for n in chosen if id_by_number[n] not in SUBPROCESS_TESTS}
+        if not verifiable:
             continue
-        tpc_nums = [n for n in chosen if id_by_number[n] in TPC_SUITE_BY_TEST_ID]
-        other_nums = [n for n in chosen if id_by_number[n] not in TPC_SUITE_BY_TEST_ID]
+
         static_cost_ms, _ = split_with_cost([(ms_by_number[n], n) for n in chosen])
         can_phase2 = (
             ENABLE_HOTPATCH
             and sel.hot_patch_targets is not None
+            and not sel.lazy_pp_mask
             and not any(tid in FRESH_IMPORT_TESTS for tid in tids)
         )
         phase = 2 if can_phase2 else 1
-        overhead_ms = 30 if phase == 2 else 300
+        overhead_ms = 30 if phase == 2 else 280
 
+        lazy_pp_nums: set[int] = set()
+        if sel.lazy_pp_mask and number_by_index is not None:
+            x = sel.lazy_pp_mask
+            while x:
+                lsb = x & -x
+                idx = lsb.bit_length() - 1
+                num = number_by_index[idx]
+                if num is not None and num in verifiable:
+                    lazy_pp_nums.add(num)
+                x ^= lsb
+
+        tpc_nums = [n for n in (verifiable - lazy_pp_nums) if id_by_number[n] in TPC_SUITE_BY_TEST_ID]
         tpc_mode: str | None = None
         if tpc_nums and ENABLE_TPC_FAST:
             tpc_mode = select_tpc_mode(sel)
-            if tpc_mode is None:
-                continue
-            if not ENABLE_TPC_FAST_B and tpc_mode != "fast_a":
-                continue
-            other_durs = [ms_by_number[n] for n in other_nums]
-            sc_other, _ = (
-                split_with_cost([(ms_by_number[n], n) for n in other_nums])
-                if other_nums
-                else (0, [])
+            if tpc_mode is not None and not ENABLE_TPC_FAST_B and tpc_mode != "fast_a":
+                tpc_mode = None
+
+        rem_verifiable = verifiable - lazy_pp_nums
+
+        # Identify high-ROI heavy decapitation targets inside rem_verifiable.
+        raw_decap: list[tuple[int, int, int]] = []  # (sim_ms, est_cpu_ms, num)
+        for num in rem_verifiable:
+            tid = id_by_number[num]
+            sim_ms = ms_by_number[num]
+            if tid in TPC_SUITE_BY_TEST_ID:
+                if tpc_mode is None:
+                    continue
+                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number)
+                raw_decap.append((sim_ms, c_ms, num))
+            elif tid in (OPT_TPCH_TEST_ID, MAX_NODES_TEST_ID, GEN_MEM_TEST_ID):
+                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number)
+                if c_ms < sim_ms:
+                    raw_decap.append((sim_ms, c_ms, num))
+            elif sim_ms >= 1000:
+                c_ms = cpu_by_number[num]
+                if c_ms <= sim_ms * 0.78:
+                    raw_decap.append((sim_ms, c_ms, num))
+
+        # Order decapitation targets by execution CPU ascending (cheapest proof first)
+        # while selecting the greedy prefix that maximizes net makespan reduction.
+        raw_decap.sort(key=lambda item: (-item[0], item[1], item[2]))
+        chosen_decap: list[int] = []
+        cur_pool = chosen - lazy_pp_nums
+        cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
+        acc_decap_cpu = 0
+        best_net = (static_cost_ms - cur_cost) - (15 if lazy_pp_nums else 0)
+        best_prefix: list[int] = []
+        trial_pool = set(cur_pool)
+        for _sim_ms, c_ms, num in raw_decap:
+            trial_pool.discard(num)
+            acc_decap_cpu += c_ms
+            new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial_pool])
+            net = (static_cost_ms - new_cost) - acc_decap_cpu - (15 if lazy_pp_nums else 0)
+            chosen_decap.append(num)
+            if net >= best_net + 300:
+                best_net = net
+                best_prefix = list(chosen_decap)
+
+        # Sort selected decap targets by estimated CPU ascending so cheap verifiers run first.
+        decap_targets = sorted(
+            best_prefix,
+            key=lambda n: (
+                _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number),
+                -ms_by_number[n],
+                id_by_number[n],
+            ),
+        )
+        decap_set = set(decap_targets)
+        tail_nums = rem_verifiable - decap_set
+        tail_cpus = [cpu_by_number[n] for n in tail_nums]
+
+        if decap_targets or lazy_pp_nums:
+            decap_cpu = sum(
+                _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number)
+                for n in decap_targets
+            ) + (15 if lazy_pp_nums else 0)
+            pool_after_decap = chosen - lazy_pp_nums - decap_set
+            cost_after_decap, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_decap])
+            pool_after_all = pool_after_decap - tail_nums
+            cost_after_all, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_all])
+
+            can_verify_tail = (
+                bool(tail_nums)
+                and not (sel.fixture_only and sum(tail_cpus) > VERIFY_FIXTURE_MAX_MS)
+                and max(tail_cpus) <= MAX_SINGLE_TEST_MS
+                and sum(tail_cpus) <= MAX_COMMIT_VERIFY_MS
+                and (cost_after_decap - cost_after_all) - sum(tail_cpus) >= MIN_GAIN_MS
             )
-            tpc_cpu_ms = sum(
-                TPC_EST_CPU_MS[(TPC_SUITE_BY_TEST_ID[id_by_number[n]], tpc_mode)]
-                for n in tpc_nums
-            )
-            verify_tail = (
-                not other_nums
-                or (
-                    max(other_durs) <= MAX_SINGLE_TEST_MS
-                    and sum(other_durs) <= MAX_COMMIT_VERIFY_MS
-                    and sc_other - sum(other_durs) >= MIN_GAIN_MS
-                )
-            )
-            if verify_tail:
-                est_cpu_ms = overhead_ms + sum(other_durs) + tpc_cpu_ms
-                expected_gain_ms = static_cost_ms - est_cpu_ms
+            if can_verify_tail:
+                est_cpu_ms = overhead_ms + decap_cpu + sum(tail_cpus)
+                expected_gain_ms = (static_cost_ms - cost_after_all) - est_cpu_ms
             else:
-                probe_ms = min(sum(other_durs), TPC_PROBE_BUDGET_MS)
-                est_cpu_ms = overhead_ms + probe_ms + tpc_cpu_ms
-                expected_gain_ms = (static_cost_ms - sc_other) - est_cpu_ms
-            if expected_gain_ms < TPC_MIN_GAIN_MS:
-                continue
+                probe_ms = min(sum(tail_cpus), TPC_PROBE_BUDGET_MS) if decap_targets else 0
+                est_cpu_ms = overhead_ms + probe_ms + decap_cpu
+                expected_gain_ms = (static_cost_ms - cost_after_decap) - est_cpu_ms
+
+            has_heavy_tpc_or_max = any(
+                id_by_number[n] in TPC_SUITE_BY_TEST_ID or id_by_number[n] == MAX_NODES_TEST_ID
+                for n in decap_targets
+            )
+            min_req = TPC_MIN_GAIN_MS if has_heavy_tpc_or_max else MIN_DECAP_GAIN_MS
+            if lazy_pp_nums and not decap_targets:
+                min_req = MIN_GAIN_MS
+            if expected_gain_ms < min_req:
+                # Fallback: check if the whole commit qualifies as a small normal commit without decap.
+                if not tail_nums or max(tail_cpus) > MAX_SINGLE_TEST_MS or sum(tail_cpus) > MAX_COMMIT_VERIFY_MS:
+                    continue
+                all_cpus = [cpu_by_number[n] for n in verifiable]
+                if max(all_cpus) > MAX_SINGLE_TEST_MS or sum(all_cpus) > MAX_COMMIT_VERIFY_MS:
+                    continue
+                if sel.fixture_only and sum(all_cpus) > VERIFY_FIXTURE_MAX_MS:
+                    continue
+                decap_targets = []
+                est_cpu_ms = overhead_ms + sum(all_cpus)
+                after_c, _ = split_with_cost([(ms_by_number[n], n) for n in (chosen - verifiable)])
+                expected_gain_ms = (static_cost_ms - after_c) - est_cpu_ms
+                if expected_gain_ms < MIN_GAIN_MS:
+                    continue
         else:
-            durations = [ms_by_number[n] for n in chosen]
-            max_ms = max(durations)
-            total_ms = sum(durations)
-            if max_ms > MAX_SINGLE_TEST_MS or total_ms > MAX_COMMIT_VERIFY_MS:
+            all_cpus = [cpu_by_number[n] for n in verifiable]
+            if max(all_cpus) > MAX_SINGLE_TEST_MS or sum(all_cpus) > MAX_COMMIT_VERIFY_MS:
                 continue
-            if sel.fixture_only and total_ms > VERIFY_FIXTURE_MAX_MS:
+            if sel.fixture_only and sum(all_cpus) > VERIFY_FIXTURE_MAX_MS:
                 continue
-            est_cpu_ms = overhead_ms + total_ms
-            expected_gain_ms = static_cost_ms - est_cpu_ms
+            est_cpu_ms = overhead_ms + sum(all_cpus)
+            after_c, _ = split_with_cost([(ms_by_number[n], n) for n in (chosen - verifiable)])
+            expected_gain_ms = (static_cost_ms - after_c) - est_cpu_ms
             if expected_gain_ms < MIN_GAIN_MS:
                 continue
 
@@ -712,6 +969,8 @@ def plan_verification(
                 est_cpu_ms=est_cpu_ms,
                 expected_gain_ms=expected_gain_ms,
                 tpc_mode=tpc_mode,
+                lazy_pp_nums=lazy_pp_nums,
+                decap_targets=decap_targets,
             )
         )
 
@@ -739,6 +998,7 @@ def _prewarm_for_phase2(
     phase2_tasks: list[VerifyTask],
     id_by_number: dict[int, str],
     ms_by_number: dict[int, int],
+    cpu_by_number: dict[int, int],
 ) -> None:
     """Import sqlglot core and shared/first-run test modules once in parent before Phase-2 forks."""
     if not phase2_tasks:
@@ -746,8 +1006,6 @@ def _prewarm_for_phase2(
     os.chdir(SOURCE)
     if str(SOURCE) not in sys.path:
         sys.path.insert(0, str(SOURCE))
-    # Replace ProcessPoolExecutor BEFORE importing test_optimizer/test_executor so their
-    # `from concurrent.futures import ProcessPoolExecutor` binds _InProcessExecutor.
     _patch_pool_references()
     import sqlglot  # noqa: F401
 
@@ -758,24 +1016,26 @@ def _prewarm_for_phase2(
             needed_mods.add(module_name(rel_path))
         for rel_path, _, _, _ in task.selection.attr_hot_targets or ():
             needed_mods.add(module_name(rel_path))
-        ordered = sorted(task.chosen, key=lambda n: (ms_by_number[n], id_by_number[n]))
-        # Always pre-import the cheapest test's module (guaranteed to run first).
+        verifiable = [n for n in task.chosen if id_by_number[n] not in SUBPROCESS_TESTS]
+        if not verifiable:
+            continue
+        ordered = sorted(verifiable, key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]))
         first_file = id_by_number[ordered[0]].split("::", 1)[0]
         first_mod = first_file[:-3].replace("/", ".")
         if first_mod != "tests.test_executor":
             needed_mods.add(first_mod)
-        task_mods = {id_by_number[n].split("::", 1)[0][:-3].replace("/", ".") for n in task.chosen}
+        task_mods = {id_by_number[n].split("::", 1)[0][:-3].replace("/", ".") for n in verifiable}
         for mod in task_mods:
             mod_task_count[mod] = mod_task_count.get(mod, 0) + 1
 
-    # Also pre-import any test module shared by >= 2 Phase-2 tasks to amortize import cost.
     for mod, count in mod_task_count.items():
         if count >= 2:
             needed_mods.add(mod)
 
-    if "tests.test_executor" in needed_mods and not any(
-        id_by_number[n] in TPC_EXECUTOR_TESTS
-        and not (t.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
+    # Install lazy numpy/pandas stubs BEFORE importing tests.test_optimizer or tests.test_executor!
+    if ("tests.test_executor" in needed_mods or "tests.test_optimizer" in needed_mods) and not any(
+        (id_by_number[n] in TPC_SUITE_BY_TEST_ID and not t.tpc_mode)
+        or (id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(t.selection))
         for t in phase2_tasks
         for n in t.chosen
     ):
@@ -785,8 +1045,103 @@ def _prewarm_for_phase2(
         if mod_name not in sys.modules:
             try:
                 importlib.import_module(mod_name)
+                if mod_name in ("tests.test_optimizer", "tests.test_executor"):
+                    _patch_pool_references()
             except Exception as err:
                 log(f"prewarm skip {mod_name}: {err}")
+
+
+def _run_batch_parallel(
+    tasks: list[VerifyTask],
+    id_by_number: dict[int, str],
+    ms_by_number: dict[int, int],
+    cpu_by_number: dict[int, int],
+    out_fd: int | None,
+    stop_at: float,
+    verified: dict[str, set[int]],
+) -> None:
+    """Run a batch of independent forked verification tasks with up to MAX_PARALLEL_CHILDREN concurrency."""
+    queue = list(tasks)
+    # active: r_fd -> (pid, task, deadline, chunks_list)
+    active: dict[int, tuple[int, VerifyTask, float, list[bytes]]] = {}
+
+    def finish_child(r_fd: int, timed_out: bool) -> None:
+        pid, task, limit_deadline, chunks = active.pop(r_fd)
+        try:
+            os.close(r_fd)
+        except OSError:
+            pass
+        if timed_out:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        _, status, rusage = os.wait4(pid, 0)
+        if timed_out:
+            log(f"{task.commit}: verify killed after timeout p{task.phase}")
+            verified[task.commit] = task.chosen
+            return
+        child_cpu = rusage.ru_utime + rusage.ru_stime
+        raw = b"".join(chunks)
+        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0 or not raw or raw == b"FAIL_PATCH":
+            log(f"{task.commit}: verify fallback p{task.phase} ({child_cpu:.3f}s, status={status})")
+            verified[task.commit] = task.chosen
+            return
+        try:
+            data = json.loads(raw)
+            passed_set = set(data["passed"])
+            mtag = f" tpc={task.tpc_mode}" if task.tpc_mode else ""
+            dtag = f" decap={len(task.decap_targets)}" if task.decap_targets else ""
+            log(
+                f"{task.commit}: p{task.phase}{mtag}{dtag} cpu={child_cpu:.3f}s "
+                f"pass={len(passed_set)} fail={len(data['failed'])}/{len(task.chosen)}"
+            )
+            verified[task.commit] = task.chosen - passed_set
+        except Exception:
+            verified[task.commit] = task.chosen
+
+    while queue or active:
+        # Run 1 child at a time initially to avoid SMT cache contention (+0.7s CPU);
+        # automatically scale to 2-core parallelism if wall-clock elapsed exceeds 35s.
+        cur_limit = max(1, MAX_PARALLEL_CHILDREN) if (stop_at - time.monotonic() < VERIFY_WALL_BUDGET_S - 35.0) else 1
+        while queue and len(active) < cur_limit:
+            now = time.monotonic()
+            remaining = stop_at - now
+            if remaining <= 0:
+                for skipped in queue:
+                    log(f"{skipped.commit}: verify skipped, wall budget spent")
+                queue.clear()
+                break
+            task = queue.pop(0)
+            limit_s = min(CHILD_LIMIT_BASE_S + CHILD_LIMIT_FACTOR * task.est_cpu_ms / 1000, remaining)
+            pid, r_fd = _start_child_verification(task, id_by_number, ms_by_number, cpu_by_number, out_fd)
+            active[r_fd] = (pid, task, time.monotonic() + limit_s, [])
+
+        if not active:
+            break
+
+        now = time.monotonic()
+        expired = [r_fd for r_fd, (_, _, dl, _) in active.items() if now >= dl]
+        for r_fd in expired:
+            finish_child(r_fd, timed_out=True)
+        if not active:
+            continue
+
+        min_rem = min(dl - time.monotonic() for _, _, dl, _ in active.values())
+        if min_rem <= 0:
+            continue
+        ready, _, _ = select.select(list(active.keys()), [], [], min_rem)
+        for r_fd in ready:
+            if r_fd not in active:
+                continue
+            try:
+                chunk = os.read(r_fd, 65536)
+            except OSError:
+                chunk = b""
+            if not chunk:
+                finish_child(r_fd, timed_out=False)
+            else:
+                active[r_fd][3].append(chunk)
 
 
 def verify_batches(
@@ -795,26 +1150,39 @@ def verify_batches(
     id_by_number: dict[int, str],
     ms_by_number: dict[int, int],
     out_fd: int | None,
+    cpu_by_number: dict[int, int] | None = None,
 ) -> dict[str, set[int]]:
     """Run Phase-1 (clean fork) then Phase-2 (pre-warmed hot-patch fork) verification."""
     verified: dict[str, set[int]] = {}
     if not hasattr(os, "fork"):
         return verified
+    if cpu_by_number is None:
+        cpu_by_number = ms_by_number
 
-    # Pre-import heavy third-party C extensions once in parent BEFORE Phase 1 forks
-    # (independent of sqlglot, shared via COW across both Phase 1 and Phase 2).
-    # Only import numpy/pandas eagerly when a task actually runs TPC-H/TPC-DS tests.
     all_tasks = phase1 + phase2
-    needs_opt = any(id_by_number[n].startswith("tests/test_optimizer.py::") for t in all_tasks for n in t.chosen)
-    needs_exec = any(id_by_number[n].startswith("tests/test_executor.py::") for t in all_tasks for n in t.chosen)
-    needs_tpc = any(
-        id_by_number[n] in TPC_EXECUTOR_TESTS
-        and not (t.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
+    if not all_tasks:
+        return verified
+
+    # Only pre-import duckdb in parent if a scheduled task will actually run test_optimizer
+    # or real-unittest test_executor tests (fast cached TPC / opt_tpch never use duckdb).
+    needs_duckdb = any(
+        id_by_number[n].startswith("tests/test_optimizer.py::")
+        or (
+            id_by_number[n].startswith("tests/test_executor.py::")
+            and not (t.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
+            and not (id_by_number[n] == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(t.selection))
+        )
         for t in all_tasks
         for n in t.chosen
     )
-    if needs_opt or needs_exec:
-        for pkg in ("duckdb", "numpy", "pandas") if needs_tpc else ("duckdb",):
+    needs_real_tpc = any(
+        (id_by_number[n] in TPC_SUITE_BY_TEST_ID and not t.tpc_mode)
+        or (id_by_number[n] == OPT_TPCH_TEST_ID and not _can_fast_opt_tpch(t.selection))
+        for t in all_tasks
+        for n in t.chosen
+    )
+    if needs_duckdb:
+        for pkg in ("duckdb", "numpy", "pandas") if needs_real_tpc else ("duckdb",):
             try:
                 importlib.import_module(pkg)
             except Exception:
@@ -822,21 +1190,11 @@ def verify_batches(
 
     stop_at = time.monotonic() + VERIFY_WALL_BUDGET_S
 
-    def run(task: VerifyTask) -> None:
-        remaining = stop_at - time.monotonic()
-        if remaining <= 0:
-            log(f"{task.commit}: verify skipped, wall budget spent")
-            return
-        limit_s = min(CHILD_LIMIT_BASE_S + CHILD_LIMIT_FACTOR * task.est_cpu_ms / 1000, remaining)
-        verified[task.commit] = _run_child_verification(task, id_by_number, ms_by_number, out_fd, limit_s)
+    if phase1:
+        _run_batch_parallel(phase1, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified)
 
-    for task in phase1:
-        run(task)
-
-    # Phase 2: pre-warm sqlglot + needed test modules once in parent, then fork + hot-patch.
     if phase2 and time.monotonic() < stop_at:
-        _prewarm_for_phase2(phase2, id_by_number, ms_by_number)
-        for task in phase2:
-            run(task)
+        _prewarm_for_phase2(phase2, id_by_number, ms_by_number, cpu_by_number)
+        _run_batch_parallel(phase2, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified)
 
     return verified

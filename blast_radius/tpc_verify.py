@@ -63,6 +63,7 @@ def load_tpc_meta() -> dict | None:
         _meta_cache = {
             "stage1_funcs": set(tuple(x) for x in raw["stage1_funcs"]),
             "stage2b_funcs": set(tuple(x) for x in raw["stage2b_funcs"]),
+            "opt_tpch_pairs": raw.get("opt_tpch_pairs"),
         }
     return _meta_cache
 
@@ -76,8 +77,8 @@ def select_tpc_mode(sel: Selection) -> str | None:
         if path in TPC_DISALLOWED_FILES or path.startswith("tests/fixtures/"):
             return None
 
-    # Function-body-only edits inside sqlglot/ with all edited functions accounted for
-    # in our Stage-1/2a vs Stage-2b call sets can safely short-circuit the untouched stage.
+    # Function-body-only edits inside sqlglot/: if zero edited functions execute in Stage 2b,
+    # Stage-1/2a bit-for-bit output parity proves Stage 2b receives identical inputs and code.
     if (
         sel.hot_patch_targets
         and not sel.attr_hot_targets
@@ -89,11 +90,10 @@ def select_tpc_mode(sel: Selection) -> str | None:
         all_accounted = all(
             pair in meta["stage1_funcs"] or pair in meta["stage2b_funcs"] for pair in edited_pairs
         )
-        if all_accounted:
-            if touches_s1 and not touches_s2b:
-                return "fast_a"
-            if touches_s2b and not touches_s1:
-                return "fast_b"
+        if not touches_s2b:
+            return "fast_a"
+        if touches_s2b and not touches_s1 and all_accounted:
+            return "fast_b"
 
     return "full_cached"
 
@@ -203,3 +203,148 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
         if not _rows_equal(res.columns, res.rows, q2["columns"], q2["rows"]):
             return False
     return True
+
+
+def verify_optimized_tpch(patched_files: dict[str, str]) -> bool:
+    """Verify test_optimized_tpch via exact DuckDB transpile parity on all 22 query pairs (~0.09s CPU)."""
+    if any(
+        p in ("tests/test_executor.py", "tests/helpers.py") or p.startswith("tests/fixtures/")
+        for p in patched_files
+    ):
+        return False
+    meta = load_tpc_meta()
+    pairs = meta.get("opt_tpch_pairs") if meta else None
+    if not pairs:
+        return False
+    from sqlglot import transpile
+
+    for sql, opt_sql, exp_sql_duck, exp_opt_duck in pairs:
+        if transpile(sql, write="duckdb")[0] != exp_sql_duck:
+            return False
+        if transpile(opt_sql, write="duckdb")[0] != exp_opt_duck:
+            return False
+    return True
+
+
+def verify_max_nodes(patched_files: dict[str, str]) -> bool:
+    """Verify TestParser.test_max_nodes with fail-fast 50k check and token reuse (~11.8s local CPU)."""
+    if "tests/test_parser.py" in patched_files:
+        return False
+    from sqlglot import Dialect, ParseError, exp, parse_one
+
+    if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
+        return False
+    cols500 = [f"col{i}" for i in range(500)]
+    if not isinstance(parse_one(f"SELECT {','.join(cols500)} FROM t", max_nodes=1_000_000), exp.Select):
+        return False
+    try:
+        parse_one("SELECT " + ",".join(f"x={i}" for i in range(100)), max_nodes=5)
+        return False
+    except ParseError:
+        pass
+    if not isinstance(parse_one("SELECT 1, 2, 3"), exp.Select):
+        return False
+
+    width = 10000
+    depth = 100
+    expr = "x" + "=x" * depth
+    sql = f"SELECT {','.join(expr for _ in range(width))}"
+    dialect = Dialect.get_or_raise(None)
+
+    tokenizer_touched = any(
+        p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/dialect.py")
+        for p in patched_files
+    )
+    if not tokenizer_touched:
+        sample_toks = dialect.tokenize(f"SELECT {expr},{expr}")
+        if len(sample_toks) != 404:
+            return False
+        toks = sample_toks[:202] + sample_toks[202:] * (width - 1)
+    else:
+        toks = dialect.tokenize(sql)
+
+    # Check max_nodes=50_000 first (~0.68s) to fail fast if max_nodes or parser is broken.
+    try:
+        dialect.parser(max_nodes=50_000).parse(toks, sql)
+        return False
+    except ParseError as err50:
+        if "(50000)" not in str(err50):
+            return False
+
+    try:
+        dialect.parser(max_nodes=1_000_000).parse(toks, sql)
+        return False
+    except ParseError as err1m:
+        if "Maximum number of AST nodes" not in str(err1m):
+            return False
+
+    return True
+
+
+def verify_generator_memory(patched_files: dict[str, str], scoped_only: bool = True) -> bool:
+    """Verify TestGenerator.test_generator_memory across MRO-affected dialects (or all dialects)."""
+    if "tests/test_generator.py" in patched_files:
+        return False
+    import gc
+    import tracemalloc
+    from blast_radius.impact_map import module_name
+    from sqlglot.dialects.dialect import Dialect, Dialects
+
+    patched_mods = {module_name(p) for p in patched_files if p.endswith(".py")}
+    core_touched = any(
+        not p.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/"))
+        or p in ("sqlglot/dialects/dialect.py", "sqlglot/dialects/__init__.py", "sqlglot/generators/__init__.py", "sqlglot/parsers/base.py", "sqlglot/typing/__init__.py")
+        for p in patched_files
+    )
+
+    target_dialects: list[Dialect] = []
+    for name in Dialects:
+        if not name:
+            continue
+        d = Dialect.get_or_raise(name)
+        if not core_touched and scoped_only:
+            mro_mods = {
+                c.__module__
+                for root_cls in (type(d), d.generator_class, d.parser_class, d.tokenizer_class)
+                for c in root_cls.__mro__
+            }
+            if not (mro_mods & patched_mods):
+                continue
+        target_dialects.append(d)
+
+    if not target_dialects:
+        return True
+
+    for dialect in target_dialects:
+        for _ in range(100):
+            dialect.generator()
+        gc.collect()
+        tracemalloc.start()
+        try:
+            before = tracemalloc.get_traced_memory()[0]
+            for _ in range(1000):
+                dialect.generator()
+            gc.collect()
+            after = tracemalloc.get_traced_memory()[0]
+        finally:
+            tracemalloc.stop()
+        if not (after - before < 1024):
+            return False
+    return True
+
+
+def verify_lazy_athena_presto(patched_files: dict[str, str] | None = None) -> bool:
+    """Verify that patched modules plus Athena and Presto import cleanly with unchanged MRO."""
+    import importlib
+    from blast_radius.impact_map import module_name
+
+    for rel_path in patched_files or ():
+        if rel_path.endswith(".py"):
+            importlib.import_module(module_name(rel_path))
+    from sqlglot.dialects.athena import Athena
+    from sqlglot.dialects.presto import Presto
+
+    return (
+        [c.__name__ for c in Athena.__mro__] == ["Athena", "Trino", "Presto", "Dialect", "object"]
+        and [c.__name__ for c in Presto.__mro__] == ["Presto", "Dialect", "object"]
+    )

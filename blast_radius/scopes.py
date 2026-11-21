@@ -27,17 +27,31 @@ if hasattr(ast, "TryStar"):
 ENCODING_RE = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
 
 
+_LEAF_EXPR_NODES = (
+    ast.Name,
+    ast.Constant,
+    ast.expr_context,
+    ast.operator,
+    ast.unaryop,
+    ast.boolop,
+    ast.cmpop,
+    ast.arg,
+)
+
+
 class Scopes:
     """Where each line of a module sits: functions, classes, statements, class assigns."""
 
-    def __init__(self, tree: ast.Module):
+    def __init__(self, tree: ast.Module, has_lambda: bool = True):
         self.tree = tree
+        self._has_lambda = has_lambda
         self.functions: list[tuple[int, int, int, str, ast.AST]] = []
         self.lambdas: list[tuple[int, int]] = []
         self.classes: list[tuple[int, int, str]] = []
         self.by_qualname: dict[str, list[tuple[int, int]]] = {}
         self.statements: list[tuple[int, int, ast.stmt]] = []
         self.class_assigns: dict[tuple[str, str], ast.stmt] = {}
+        self.module_assigns: dict[str, ast.stmt] = {}
         self.docstrings: set[int] = set()
         self.type_checking_ranges: list[tuple[int, int]] = []
         self.has_future_annotations = any(
@@ -46,38 +60,48 @@ class Scopes:
             and any(a.name == "annotations" for a in s.names)
             for s in tree.body
         )
+        for stmt in tree.body:
+            attr = _single_assign_target(stmt)
+            if attr is not None:
+                self.module_assigns[attr] = stmt
         self._walk(tree, "")
 
     def _walk(self, node: ast.AST, prefix: str) -> None:
+        if isinstance(node, _LEAF_EXPR_NODES):
+            return
         body = getattr(node, "body", None)
         if isinstance(body, list) and body and _is_docstring(body[0]):
             self.docstrings.update(range(body[0].lineno, body[0].end_lineno + 1))
         for child in ast.iter_child_nodes(node):
+            if isinstance(child, _LEAF_EXPR_NODES):
+                continue
             if isinstance(child, ast.stmt):
                 self.statements.append((child.lineno, child.end_lineno, child))
-            if isinstance(child, ast.If) and is_type_checking_guard(child) and child.body:
-                self.type_checking_ranges.append((child.body[0].lineno, child.body[-1].end_lineno))
-            if isinstance(child, FUNCTION_NODES):
-                qualname = prefix + child.name
-                head = min([child.lineno] + [d.lineno for d in child.decorator_list])
-                body_start = child.body[0].lineno
-                self.functions.append((body_start, child.end_lineno, head, qualname, child))
-                self.by_qualname.setdefault(qualname, []).append((body_start, child.end_lineno))
-                self._walk(child, qualname + ".<locals>.")
-            elif isinstance(child, ast.ClassDef):
-                qualname = prefix + child.name
-                head = min([child.lineno] + [d.lineno for d in child.decorator_list])
-                self.classes.append((head, child.end_lineno, qualname))
-                # Record direct class-body attribute assignments for fine-grained dict/attr tracking.
-                for stmt in child.body:
-                    attr = _single_assign_target(stmt)
-                    if attr is not None:
-                        self.class_assigns[(qualname, attr)] = stmt
-                self._walk(child, qualname + ".")
-            elif isinstance(child, ast.Lambda):
-                self.lambdas.append((child.body.lineno, child.body.end_lineno))
+                if isinstance(child, ast.If) and is_type_checking_guard(child) and child.body:
+                    self.type_checking_ranges.append((child.body[0].lineno, child.body[-1].end_lineno))
+                if isinstance(child, FUNCTION_NODES):
+                    qualname = prefix + child.name
+                    head = min([child.lineno] + [d.lineno for d in child.decorator_list])
+                    body_start = child.body[0].lineno
+                    self.functions.append((body_start, child.end_lineno, head, qualname, child))
+                    self.by_qualname.setdefault(qualname, []).append((body_start, child.end_lineno))
+                    self._walk(child, qualname + ".<locals>.")
+                elif isinstance(child, ast.ClassDef):
+                    qualname = prefix + child.name
+                    head = min([child.lineno] + [d.lineno for d in child.decorator_list])
+                    self.classes.append((head, child.end_lineno, qualname))
+                    for stmt in child.body:
+                        attr = _single_assign_target(stmt)
+                        if attr is not None:
+                            self.class_assigns[(qualname, attr)] = stmt
+                    self._walk(child, qualname + ".")
+                else:
+                    self._walk(child, prefix)
+            elif self._has_lambda:
+                if isinstance(child, ast.Lambda):
+                    self.lambdas.append((child.body.lineno, child.body.end_lineno))
                 self._walk(child, prefix)
-            else:
+            elif isinstance(child, (ast.ExceptHandler, ast.match_case)):
                 self._walk(child, prefix)
 
     def function_at(self, lineno: int):
@@ -118,6 +142,15 @@ class Scopes:
         for (cqual, attr), stmt in self.class_assigns.items():
             if cqual == cls_qualname and stmt.lineno <= lineno <= stmt.end_lineno:
                 return cls_qualname, attr, stmt
+        return None
+
+    def module_assign_at(self, lineno: int) -> tuple[str, ast.stmt] | None:
+        """If lineno lies inside a top-level module assignment, return (attr, stmt)."""
+        if self.class_at(lineno) is not None or self.function_at(lineno) is not None:
+            return None
+        for attr, stmt in self.module_assigns.items():
+            if stmt.lineno <= lineno <= stmt.end_lineno:
+                return attr, stmt
         return None
 
     def in_type_checking(self, lineno: int) -> bool:
@@ -185,6 +218,48 @@ def canon_ast(node: ast.AST | list | None, ignore_annotations: bool = False):
     return (type(node).__name__, *fields)
 
 
+def _same_stmt_block(
+    old_body: list[ast.stmt],
+    new_body: list[ast.stmt],
+    ignore_annotations: bool,
+    old_lines: set[int],
+    new_lines: set[int],
+) -> bool | None:
+    """Compare two statement lists by only canonicalizing statements intersecting changed lines."""
+    old_stmts = [
+        s for s in old_body
+        if not (isinstance(s, ast.If) and is_type_checking_guard(s) and not s.orelse)
+    ]
+    new_stmts = [
+        s for s in new_body
+        if not (isinstance(s, ast.If) and is_type_checking_guard(s) and not s.orelse)
+    ]
+    if len(old_stmts) != len(new_stmts):
+        return None
+    for so, sn in zip(old_stmts, new_stmts):
+        touched = any(so.lineno <= ln <= so.end_lineno for ln in old_lines) or any(
+            sn.lineno <= ln <= sn.end_lineno for ln in new_lines
+        )
+        if not touched:
+            continue
+        if isinstance(so, ast.ClassDef) and isinstance(sn, ast.ClassDef):
+            if (
+                so.name == sn.name
+                and canon_ast(so.bases, ignore_annotations) == canon_ast(sn.bases, ignore_annotations)
+                and canon_ast(so.keywords, ignore_annotations) == canon_ast(sn.keywords, ignore_annotations)
+                and canon_ast(so.decorator_list, ignore_annotations)
+                == canon_ast(sn.decorator_list, ignore_annotations)
+            ):
+                sub = _same_stmt_block(so.body, sn.body, ignore_annotations, old_lines, new_lines)
+                if sub is not None:
+                    if not sub:
+                        return False
+                    continue
+        if canon_ast(so, ignore_annotations) != canon_ast(sn, ignore_annotations):
+            return False
+    return True
+
+
 def same_ast(
     old_tree: ast.Module,
     new_tree: ast.Module,
@@ -196,28 +271,15 @@ def same_ast(
 ) -> bool:
     """True when two modules have identical normalized ASTs and identical encoding cookies.
 
-    When changed line sets are provided, only top-level statements intersecting the edit
+    When changed line sets are provided, only statements/methods intersecting the edit
     are canonicalized, avoiding full-file AST traversal on multi-thousand-line modules.
     """
     if _encoding_cookie(old_text) != _encoding_cookie(new_text):
         return False
     if old_lines is not None and new_lines is not None:
-        old_stmts = [
-            s for s in old_tree.body
-            if not (isinstance(s, ast.If) and is_type_checking_guard(s) and not s.orelse)
-        ]
-        new_stmts = [
-            s for s in new_tree.body
-            if not (isinstance(s, ast.If) and is_type_checking_guard(s) and not s.orelse)
-        ]
-        if len(old_stmts) == len(new_stmts):
-            for so, sn in zip(old_stmts, new_stmts):
-                touched = any(so.lineno <= ln <= so.end_lineno for ln in old_lines) or any(
-                    sn.lineno <= ln <= sn.end_lineno for ln in new_lines
-                )
-                if touched and canon_ast(so, ignore_annotations) != canon_ast(sn, ignore_annotations):
-                    return False
-            return True
+        fast = _same_stmt_block(old_tree.body, new_tree.body, ignore_annotations, old_lines, new_lines)
+        if fast is not None:
+            return fast
     return canon_ast(old_tree, ignore_annotations) == canon_ast(new_tree, ignore_annotations)
 
 
@@ -301,6 +363,56 @@ def _function_binding_shape(func_node: ast.AST) -> tuple:
     )
 
 
+def _names_used_outside_lines(func_node: ast.AST, candidates: frozenset[str], edited_lines: set[int]) -> bool:
+    """True if any variable in `candidates` is referenced outside `edited_lines` or inside a nested scope."""
+    for arg in getattr(func_node, "args", ast.arguments()).posonlyargs + getattr(
+        func_node, "args", ast.arguments()
+    ).args + getattr(func_node, "args", ast.arguments()).kwonlyargs:
+        if arg.arg in candidates:
+            return True
+    for vararg in (getattr(func_node.args, "vararg", None), getattr(func_node.args, "kwarg", None)):
+        if vararg is not None and vararg.arg in candidates:
+            return True
+
+    stack: list[tuple[ast.AST, bool]] = [(s, False) for s in getattr(func_node, "body", [])]
+    while stack:
+        cur, in_nested = stack.pop()
+        nested = in_nested or isinstance(
+            cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+        )
+        if isinstance(cur, ast.Name) and cur.id in candidates:
+            if nested or getattr(cur, "lineno", -1) not in edited_lines:
+                return True
+        elif isinstance(cur, (ast.Global, ast.Nonlocal)) and any(n in candidates for n in cur.names):
+            return True
+        stack.extend((ch, nested) for ch in ast.iter_child_nodes(cur))
+    return False
+
+
+def same_local_binding_semantics(
+    old_func: ast.AST,
+    new_func: ast.AST,
+    old_lines: set[int],
+    new_lines: set[int],
+) -> bool:
+    """True when an edit inside a function cannot alter lexical bindings on unexecuted paths."""
+    old_async, old_yield, old_locals, old_globals, old_nonlocals = _function_binding_shape(old_func)
+    new_async, new_yield, new_locals, new_globals, new_nonlocals = _function_binding_shape(new_func)
+    if (
+        old_async != new_async
+        or old_yield != new_yield
+        or old_globals != new_globals
+        or old_nonlocals != new_nonlocals
+    ):
+        return False
+    diff_locals = old_locals ^ new_locals
+    if not diff_locals:
+        return True
+    return not _names_used_outside_lines(old_func, diff_locals, old_lines) and not _names_used_outside_lines(
+        new_func, diff_locals, new_lines
+    )
+
+
 def _ast_dict_key_tokens(key_node: ast.AST) -> tuple[str, ...] | None:
     """Convert an AST dict key node into candidate _TrackedDict lookup tokens."""
     if isinstance(key_node, ast.Constant):
@@ -329,6 +441,22 @@ def _extract_dict_entries(dict_node: ast.AST) -> tuple[dict[tuple[str, ...], ast
     spreads: list[str] = []
     for k, v in zip(dict_node.keys, dict_node.values):
         if k is None:
+            if (
+                isinstance(v, ast.DictComp)
+                and len(v.generators) == 1
+                and not v.generators[0].ifs
+                and not v.generators[0].is_async
+                and isinstance(v.generators[0].target, ast.Name)
+                and isinstance(v.key, ast.Name)
+                and v.key.id == v.generators[0].target.id
+                and isinstance(v.generators[0].iter, (ast.Set, ast.List, ast.Tuple))
+            ):
+                for elt in v.generators[0].iter.elts:
+                    toks = _ast_dict_key_tokens(elt)
+                    if toks is None or toks in entries:
+                        return None
+                    entries[toks] = v.value
+                continue
             spreads.append(ast.dump(v))
             continue
         toks = _ast_dict_key_tokens(k)

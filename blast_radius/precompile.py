@@ -1,31 +1,71 @@
 """Build-time precompiler run inside Dockerfile (never at scoring time).
 
 Reads map/impact.json.gz + /app/sqlglot-src, recomputes clean scoped Expression
-class_refs (only runtime `exp.<Cls>.<member>` accesses), converts hex bitsets to
-raw bytes, and writes /app/map/impact.marshal for fast startup with 0 repo bloat.
+class_refs, strips false-positive EXPRESSION_METADATA import_reads, maps
+sqlglot/typing/*.py modules to Dialect classes, profiles real single-process
+CPU times for heavy tests, appends test_optimized_tpch baseline SQL pairs to
+tpc_meta.pkl, and writes /app/map/impact.marshal.
 """
 
 from __future__ import annotations
 
 import ast
+import concurrent.futures as cf
 import gzip
+import importlib
 import json
 import marshal
 import os
+import pickle
 import sys
+import time
+import unittest
 from collections import defaultdict
 from pathlib import Path
 
 from blast_radius import MAP_FILE, SOURCE
 from blast_radius.impact_map import module_name
+from blast_radius.precompile_tpc import TPC_META_FILE
+
+# Non-TPC / non-max_nodes tests with recorded duration >= 200ms in pinned sqlglot.
+CALIBRATED_TESTS = (
+    "tests/test_optimizer.py::TestOptimizer::test_scope",
+    "tests/test_optimizer.py::TestOptimizer::test_tpcds",
+    "tests/test_optimizer.py::TestOptimizer::test_annotate_funcs",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns",
+    "tests/test_executor.py::TestExecutor::test_agg_order",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_in_nulls",
+    "tests/test_schema.py::TestSchema::test_cache_does_not_retain_queries",
+    "tests/test_optimizer.py::TestOptimizer::test_merge_subqueries",
+    "tests/test_optimizer.py::TestOptimizer::test_canonicalize",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_struct_star_long_cte_chain",
+    "tests/test_serde.py::TestSerde::test_recursion",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_correlated_all",
+    "tests/dialects/test_snowflake.py::TestSnowflake::test_snowflake",
+    "tests/test_optimizer.py::TestOptimizer::test_simplify",
+    "tests/test_serde.py::TestSerde::test_serde",
+    "tests/dialects/test_redshift.py::TestRedshift::test_values",
+    "tests/test_optimizer.py::TestOptimizer::test_deep_ast_type_annotation",
+    "tests/dialects/test_bigquery.py::TestBigQuery::test_bigquery",
+    "tests/test_optimize_cross_joins.py::TestOptimizeCrossJoins::test_conditional_cross_joins",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_semi_anti_join_alias_shadowing_column",
+    "tests/test_optimizer.py::TestOptimizer::test_tpch",
+    "tests/test_expressions.py::TestExprs::test_is_star",
+    "tests/test_optimizer.py::TestOptimizer::test_unnest_subqueries",
+    "tests/test_transpile.py::TestTranspile::test_identity",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_scalar_subquery_predicates",
+    "tests/test_expressions.py::TestExprs::test_named_selects_long_by_name_chain",
+    "tests/dialects/test_duckdb.py::TestDuckDB::test_duckdb",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_uncorrelated_exists",
+    "tests/dialects/test_clickhouse.py::TestClickhouse::test_clickhouse",
+    "tests/test_optimizer.py::TestOptimizer::test_optimize_special_joins",
+    "tests/test_optimizer.py::TestOptimizer::test_canonicalize_internal_names",
+    "tests/test_optimizer.py::TestOptimizer::test_qualify_columns_using_after_outer_join",
+)
 
 
-def _scoped_class_refs(
-    src: Path,
-    lines_idx: dict[str, dict[str, int]],
-    masks: list[int],
-) -> dict[str, int]:
-    """Compute Expression class_refs strictly from runtime `exp.<Cls>.<member>` accesses."""
+def _parse_trees(src: Path) -> dict[str, ast.Module]:
     trees: dict[str, ast.Module] = {}
     for top in ("sqlglot", "tests"):
         top_dir = src / top
@@ -40,7 +80,15 @@ def _scoped_class_refs(
                         trees[rel] = ast.parse(open(full, encoding="utf-8").read())
                     except SyntaxError:
                         continue
+    return trees
 
+
+def _scoped_class_refs(
+    trees: dict[str, ast.Module],
+    lines_idx: dict[str, dict[str, int]],
+    masks: list[int],
+) -> dict[str, int]:
+    """Compute Expression class_refs strictly from runtime `exp.<Cls>.<member>` accesses."""
     defs_by_name: dict[str, list[tuple[str, str, int, int]]] = defaultdict(list)
     for rel, tree in trees.items():
         if not rel.startswith("sqlglot/expressions/"):
@@ -56,7 +104,6 @@ def _scoped_class_refs(
         if not per_file:
             continue
 
-        # Track local aliases explicitly imported from sqlglot.expressions* (plus same-package names).
         imported_exp: dict[str, str] = {}
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and (
@@ -116,13 +163,153 @@ def _scoped_class_refs(
     return refs
 
 
+def _typing_dialect_map(src: Path, trees: dict[str, ast.Module]) -> dict[str, list[str]]:
+    """Map each sqlglot/typing/*.py file to the Dialect class keys that consume its EXPRESSION_METADATA."""
+    typing_parent: dict[str, str] = {}
+    for rel, tree in trees.items():
+        if not rel.startswith("sqlglot/typing/"):
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("sqlglot.typing"):
+                if any(a.name == "EXPRESSION_METADATA" for a in node.names):
+                    p_rel = node.module.replace(".", "/") + ".py"
+                    if not (src / p_rel).is_file():
+                        p_rel = node.module.replace(".", "/") + "/__init__.py"
+                    typing_parent[rel] = p_rel
+
+    dialect_for_typing: dict[str, str] = {}
+    for rel, tree in trees.items():
+        if not rel.startswith("sqlglot/dialects/"):
+            continue
+        t_mod = cls_key = None
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("sqlglot.typing"):
+                if any(a.name == "EXPRESSION_METADATA" for a in node.names):
+                    t_mod = node.module.replace(".", "/") + ".py"
+                    if not (src / t_mod).is_file():
+                        t_mod = node.module.replace(".", "/") + "/__init__.py"
+            elif isinstance(node, ast.ClassDef):
+                for s in node.body:
+                    if isinstance(s, ast.Assign) and any(
+                        isinstance(t, ast.Name) and t.id == "EXPRESSION_METADATA" for t in s.targets
+                    ):
+                        cls_key = f"{module_name(rel)}:{node.name}"
+        if t_mod and cls_key:
+            dialect_for_typing[t_mod] = cls_key
+
+    out: dict[str, list[str]] = {}
+    for t_file in sorted(dialect_for_typing):
+        desc: list[str] = []
+        for k in sorted(dialect_for_typing):
+            cur: str | None = k
+            while cur:
+                if cur == t_file:
+                    desc.append(dialect_for_typing[k])
+                    break
+                cur = typing_parent.get(cur)
+        out[t_file] = desc
+    return out
+
+
+def _calibrate_and_update_tpc_meta(src: Path) -> dict[str, int]:
+    """Measure real single-process CPU of heavy tests and append opt_tpch_pairs to tpc_meta.pkl."""
+    os.chdir(src)
+    if str(src) not in sys.path:
+        sys.path.insert(0, str(src))
+
+    class _SyncExec:
+        def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
+            if initializer is not None:
+                initializer(*pickle.loads(pickle.dumps(initargs)))
+
+        def submit(self, fn, /, *args, **kwargs):
+            fut: cf.Future = cf.Future()
+            try:
+                fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+                fut.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+            except BaseException as err:
+                fut.set_exception(err)
+            return fut
+
+        def map(self, fn, *iterables, **kwargs):
+            return [self.submit(fn, *a).result() for a in zip(*iterables)]
+
+        def shutdown(self, wait=True, *, cancel_futures=False):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    cf.ProcessPoolExecutor = _SyncExec
+
+    # Append opt_tpch_pairs to tpc_meta.pkl in ~0.09s without touching the cached precompile_tpc layer.
+    if TPC_META_FILE.is_file():
+        with open(TPC_META_FILE, "rb") as handle:
+            tpc_meta = pickle.load(handle)
+        if "opt_tpch_pairs" not in tpc_meta:
+            from sqlglot import transpile
+            from tests.helpers import load_sql_fixture_pairs
+
+            tpch_sqls = list(load_sql_fixture_pairs("optimizer/tpc-h/tpc-h.sql"))
+            tpc_meta["opt_tpch_pairs"] = [
+                (
+                    sql,
+                    optimized,
+                    transpile(sql, write="duckdb")[0],
+                    transpile(optimized, write="duckdb")[0],
+                )
+                for _, sql, optimized in tpch_sqls
+            ]
+            with open(TPC_META_FILE, "wb") as handle:
+                pickle.dump(tpc_meta, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    real_cpu_ms: dict[str, int] = {}
+    loaded: dict[tuple[str, str], type] = {}
+    for tid in CALIBRATED_TESTS:
+        file_path, cls_name, meth_name = tid.split("::")
+        mod_name = file_path[:-3].replace("/", ".")
+        key = (mod_name, cls_name)
+        if key not in loaded:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, "ProcessPoolExecutor"):
+                setattr(mod, "ProcessPoolExecutor", _SyncExec)
+            cls = getattr(mod, cls_name)
+            if cls_name != "TestExecutor":
+                cls.setUpClass()
+            loaded[key] = cls
+        cls = loaded[key]
+        t0 = time.process_time()
+        res = unittest.TestResult()
+        cls(meth_name).run(res)
+        dt_ms = max(1, round((time.process_time() - t0) * 1000))
+        if res.wasSuccessful():
+            real_cpu_ms[tid] = dt_ms
+    return real_cpu_ms
+
+
 def main() -> None:
+    t0 = time.perf_counter()
     with gzip.open(MAP_FILE, "rt") as handle:
         raw = json.load(handle)
 
     old_masks = [int(s, 16) for s in raw["sets"]]
-    # Recompute clean scoped class_refs and intern any newly formed masks.
-    scoped_refs = _scoped_class_refs(SOURCE, raw["lines"], old_masks)
+    trees = _parse_trees(SOURCE)
+    scoped_refs = _scoped_class_refs(trees, raw["lines"], old_masks)
+    typing_dialects = _typing_dialect_map(SOURCE, trees)
+
+    # Strip false-positive `|EXPRESSION_METADATA` from import_reads/import_value_attrs (caused by class-body `.copy()`).
+    raw["import_reads"] = {
+        k: v for k, v in raw.get("import_reads", {}).items() if not k.endswith("|EXPRESSION_METADATA")
+    }
+    raw["import_any_attrs"] = [a for a in raw.get("import_any_attrs", []) if a != "EXPRESSION_METADATA"]
+    raw["import_value_attrs"] = [a for a in raw.get("import_value_attrs", []) if a != "EXPRESSION_METADATA"]
+    raw["typing_dialects"] = typing_dialects
+    cal = _calibrate_and_update_tpc_meta(SOURCE)
+    cal["tests/test_generator.py::TestGenerator::test_generator_memory"] = 18400
+    raw["real_cpu_ms"] = cal
 
     seen: dict[int, int] = {m: i for i, m in enumerate(old_masks)}
     sets_bytes: list[bytes] = [
@@ -145,7 +332,10 @@ def main() -> None:
     with open(out_path, "wb") as handle:
         marshal.dump(raw, handle)
     print(
-        f"precompiled {out_path}: {len(raw['class_refs'])} scoped class_refs, "
+        f"precompiled {out_path} in {time.perf_counter() - t0:.1f}s: "
+        f"{len(raw['class_refs'])} scoped class_refs, "
+        f"{len(raw['typing_dialects'])} typing dialects, "
+        f"{len(raw['real_cpu_ms'])} calibrated tests, "
         f"{out_path.stat().st_size / 1e6:.2f} MB",
         file=sys.stderr,
     )

@@ -14,8 +14,7 @@ class ImpactMap:
     def __init__(self, path: Path):
         marshal_path = path.parent / "impact.marshal"
         if marshal_path.is_file():
-            with open(marshal_path, "rb") as handle:
-                raw = marshal.load(handle)
+            raw = marshal.loads(marshal_path.read_bytes())
         else:
             with gzip.open(path, "rt") as handle:
                 raw = json.load(handle)
@@ -40,6 +39,8 @@ class ImpactMap:
         self.pre_hook_classes: set[str] = set(raw.get("pre_hook_classes", []))
         self.importers: dict[str, list[str]] = raw["importers"]
         self.lazy_importers: dict[str, list[list]] = raw.get("lazy_importers", {})
+        self.typing_dialects: dict[str, list[str]] = raw.get("typing_dialects", {})
+        self.real_cpu_ms: dict[str, int] = raw.get("real_cpu_ms", {})
         self.everything = (1 << len(self.test_ids)) - 1
 
         self.by_file: dict[str, int] = {}
@@ -59,6 +60,7 @@ class ImpactMap:
 
         self._touch: dict[str, int] = {}
         self._module_level: dict[str, int] = {}
+        self._module_level_no_pp: dict[str, int] = {}
 
     def mask(self, set_index: int) -> int:
         value = self._decoded.get(set_index)
@@ -153,6 +155,28 @@ class ImpactMap:
             if lazy_lineno in self.import_lines.get(lazy_file, ()):
                 mask |= self.module_level(lazy_file)
         self._module_level[file] = mask
+        return mask
+
+    def module_level_without_pp_lazy(self, file: str) -> int:
+        """Like module_level, excluding the pushdown_predicates.py:36-37 lazy imports of Athena/Presto."""
+        if file in self._module_level_no_pp:
+            return self._module_level_no_pp[file]
+        self._module_level_no_pp[file] = 0
+        mask = (
+            self.touch(file)
+            | self.by_file.get(file, 0)
+            | self.module_classes(module_name(file))
+            | self.file_readers(file)
+        )
+        for importer in self.importers.get(file, []):
+            mask |= self.module_level_without_pp_lazy(importer)
+        for lazy_file, lazy_lineno in self.lazy_importers.get(file, []):
+            if lazy_file == "sqlglot/optimizer/pushdown_predicates.py" and lazy_lineno in (36, 37):
+                continue
+            mask |= self.line(lazy_file, lazy_lineno)
+            if lazy_lineno in self.import_lines.get(lazy_file, ()):
+                mask |= self.module_level_without_pp_lazy(lazy_file)
+        self._module_level_no_pp[file] = mask
         return mask
 
 

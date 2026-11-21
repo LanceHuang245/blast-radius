@@ -12,7 +12,6 @@ from blast_radius.scopes import (
     COMPOUND_NODES,
     Scopes,
     _extract_dict_entries,
-    _function_binding_shape,
     _is_docstring,
     canon_ast,
     comment_lines_only,
@@ -20,6 +19,7 @@ from blast_radius.scopes import (
     indent,
     same_ast,
     same_code,
+    same_local_binding_semantics,
 )
 
 SAFE_HOTPATCH_DECORATORS = frozenset({"staticmethod", "classmethod", "property"})
@@ -37,6 +37,8 @@ class Selection:
     # Phase 2 safe non-import-time literal class-attribute updates: (rel_path, cls_qual, attr, val).
     attr_hot_targets: list[tuple[str, str, str, object]] | None = None
     fixture_only: bool = False
+    # Bitmask of tests in `mask` pulled in solely by pushdown_predicates.py:36-37 lazy imports.
+    lazy_pp_mask: int = 0
 
 
 def _decorator_name(node: ast.expr) -> str | None:
@@ -198,6 +200,8 @@ class Selector:
     def __init__(self, impact: ImpactMap):
         self.impact = impact
         self._old: dict[str, tuple[str, Scopes]] = {}
+        self._no_pp_lazy: bool = False
+        self._hit_pp_lazy: bool = False
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
         self.docs_mask = sum(1 << i for i in docs)
 
@@ -207,7 +211,7 @@ class Selector:
             if not file.is_file():
                 raise Everything(f"no pinned source for {path}")
             text = file.read_text(encoding="utf-8")
-            self._old[path] = (text, Scopes(ast.parse(text)))
+            self._old[path] = (text, Scopes(ast.parse(text), has_lambda="lambda" in text))
         return self._old[path]
 
     def select(self, patch_text: str) -> tuple[int, str]:
@@ -221,11 +225,13 @@ class Selector:
             if not files:
                 raise Everything("empty patch")
             mask = 0
+            lazy_pp_mask = 0
             all_noop = True
             all_fixture_or_noop = True
             patched_files: dict[str, str] = {}
             hot_targets: list[tuple[str, str]] | None = []
             attr_targets: list[tuple[str, str, str, object]] | None = []
+            self._hit_pp_lazy = False
             for file_patch in files:
                 file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets = self.select_file_detailed(
                     file_patch, patched_files
@@ -241,6 +247,16 @@ class Selector:
                         hot_targets.extend(f_targets)
                     if attr_targets is not None and a_targets:
                         attr_targets.extend(a_targets)
+            if self._hit_pp_lazy and mask:
+                self._no_pp_lazy = True
+                try:
+                    mask_no_pp = 0
+                    for file_patch in files:
+                        fm, _, _, _, _ = self.select_file_detailed(file_patch, {})
+                        mask_no_pp |= fm
+                    lazy_pp_mask = mask & ~mask_no_pp
+                finally:
+                    self._no_pp_lazy = False
             reason = "noop" if all_noop and mask == 0 else "mapped"
             return Selection(
                 mask=mask,
@@ -249,6 +265,7 @@ class Selector:
                 hot_patch_targets=hot_targets,
                 attr_hot_targets=attr_targets,
                 fixture_only=all_fixture_or_noop and not all_noop,
+                lazy_pp_mask=lazy_pp_mask,
             )
         except Everything as reason:
             return Selection(impact.everything, f"everything ({reason})", {}, None, None, False)
@@ -289,9 +306,13 @@ class Selector:
                 raise Everything("test package plumbing")
             if path.startswith("sqlglot/") and path not in impact.lines and path not in impact.importers:
                 raise Everything(f"{path} unknown to the map")
-            # Always include tests that directly opened this .py file (e.g. test_typing.py).
+            # Always include tests that directly opened this .py file (e.g. test_typing.py),
+            # except when a sqlglot/typing/*.py change is a pure comment or AST-identical noop
+            # (test_no_redundant_expression_metadata only inspects AST imports and EXPRESSION_METADATA).
             readers = impact.file_readers(path)
             py_mask, py_noop, new_text, targets, attr_targets = self.select_python_detailed(path, fp.hunks)
+            if py_noop and path.startswith("sqlglot/typing/"):
+                readers = 0
             if not py_noop or readers:
                 patched_files[path] = new_text
             return readers | py_mask, py_noop and readers == 0, py_noop, targets, attr_targets
@@ -333,7 +354,7 @@ class Selector:
             compile(new_tree, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
             raise Everything(f"{path} no longer compiles")
-        new_scopes = Scopes(new_tree)
+        new_scopes = Scopes(new_tree, has_lambda="lambda" in new_text)
 
         # Normalized AST equivalence catches quote/paren/wrapping refactors, TYPE_CHECKING-only
         # edits, and pure type-annotation edits when `from __future__ import annotations` holds.
@@ -386,6 +407,12 @@ class Selector:
         ):
             return 0
 
+        # Try fine-grained module-level EXPRESSION_METADATA dict-key tracking for sqlglot/typing/*.py.
+        if path in self.impact.typing_dialects:
+            t_mask = self.typing_dict_level(path, old_scopes, new_scopes, removed, added)
+            if t_mask is not None:
+                return t_mask
+
         # Try fine-grained class dict-key or class attribute tracking first.
         attr_mask = self.class_attr_level(path, module, old_scopes, new_scopes, removed, added)
         if attr_mask is not None:
@@ -419,15 +446,58 @@ class Selector:
             for lineno in lines:
                 fn = scopes.function_at(lineno)
                 if fn is not None:
-                    qual = fn[3]
+                    qual = fn[3].split(".<locals>.", 1)[0]
                     bit = impact.by_test_qualname.get((path, qual))
                     if bit:
                         mask |= bit
+                        continue
+                    # Helper method inside a test class that already has line coverage: keep narrow coverage.
+                    if impact.span(path, fn[0], fn[1]):
                         continue
                 cls = scopes.class_at(lineno)
                 if cls is not None:
                     cls_mask = impact.by_class.get(f"{path}::{cls[2].replace('.', '::')}", 0)
                     mask |= cls_mask
+        return mask
+
+    def typing_dict_level(self, path: str, old_scopes: Scopes, new_scopes: Scopes, removed, added) -> int | None:
+        """Resolve an edit confined to top-level EXPRESSION_METADATA in sqlglot/typing/*.py by dict key."""
+        if not removed and not added:
+            return None
+        for old_no, _ in removed:
+            info = old_scopes.module_assign_at(old_no)
+            if info is None or info[0] != "EXPRESSION_METADATA":
+                return None
+        for new_no, _anchor, _ in added:
+            info = new_scopes.module_assign_at(new_no)
+            if info is None or info[0] != "EXPRESSION_METADATA":
+                return None
+        old_stmt = old_scopes.module_assigns.get("EXPRESSION_METADATA")
+        new_stmt = new_scopes.module_assigns.get("EXPRESSION_METADATA")
+        if old_stmt is None or new_stmt is None:
+            return None
+        old_parsed = _extract_dict_entries(old_stmt.value)
+        new_parsed = _extract_dict_entries(new_stmt.value)
+        if old_parsed is None or new_parsed is None:
+            return None
+        old_entries, old_spreads = old_parsed
+        new_entries, new_spreads = new_parsed
+        if old_spreads != new_spreads or list(old_entries) != list(new_entries):
+            return None
+        changed_keys = [
+            toks for toks in old_entries if ast.dump(old_entries[toks]) != ast.dump(new_entries[toks])
+        ]
+        if not changed_keys:
+            return 0
+        impact = self.impact
+        mask = 0
+        for cls_key in impact.typing_dialects.get(path, ()):
+            if impact.read_at_import(cls_key, "EXPRESSION_METADATA", [t for toks in changed_keys for t in toks]):
+                return None
+            mask |= impact.dict_key_usage(cls_key, "EXPRESSION_METADATA", "*")
+            for toks in changed_keys:
+                for tok in toks:
+                    mask |= impact.dict_key_usage(cls_key, "EXPRESSION_METADATA", tok)
         return mask
 
     def class_attr_level(self, path, module, old_scopes: Scopes, new_scopes: Scopes, removed, added) -> int | None:
@@ -522,6 +592,8 @@ class Selector:
         impact = self.impact
         mask = 0
         checked_funcs: set[str] = set()
+        old_lines = {n for n, _ in removed}
+        new_lines = {n for n, _, _ in added}
         for (old_no, old_text), (new_no, _anchor, new_text) in zip(removed, added):
             if indent(old_text) != indent(new_text):
                 return None
@@ -534,9 +606,9 @@ class Selector:
                 return None  # def header or decorator
             if self.runs_at_import(path, body_start, end):
                 return None
-            # Reject statement-level if local bindings or generator flags changed anywhere in the function.
+            # Reject statement-level only if non-local lexical bindings or generator flags changed.
             if qualname not in checked_funcs:
-                if _function_binding_shape(old_node) != _function_binding_shape(new_function[4]):
+                if not same_local_binding_semantics(old_node, new_function[4], old_lines, new_lines):
                     return None
                 checked_funcs.add(qualname)
             if old_no in old_scopes.docstrings:
@@ -601,7 +673,9 @@ class Selector:
         new_node = new_fn[4]
         if self.runs_at_import(path, body_start, end):
             return None
-        if _function_binding_shape(old_node) != _function_binding_shape(new_node):
+        old_lines = {n for n, _ in removed}
+        new_lines = {n for n, _, _ in added}
+        if not same_local_binding_semantics(old_node, new_node, old_lines, new_lines):
             return None
         return self._diff_stmt_lists(path, old_node.body, new_node.body, ignore_ann)
 
@@ -681,10 +755,19 @@ class Selector:
         lines = self.impact.collect_lines.get(path)
         return bool(lines) and any(first <= n <= last for n in lines)
 
+    def _module_reach(self, path: str) -> int:
+        impact = self.impact
+        if self._no_pp_lazy:
+            return impact.module_level_without_pp_lazy(path)
+        full = impact.module_level(path)
+        if full != impact.module_level_without_pp_lazy(path):
+            self._hit_pp_lazy = True
+        return full
+
     def function_level(self, path, module, body_start, end) -> int:
         mask = self.impact.span(path, body_start, end)
         if self.runs_at_import(path, body_start, end):
-            mask |= self.impact.module_level(path)
+            mask |= self._module_reach(path)
         return mask
 
     def container_level(self, path, module, scopes, lineno) -> int:
@@ -701,7 +784,7 @@ class Selector:
                     | impact.span(path, head, end)
                     | impact.by_file.get(path, 0)
                 )
-        return impact.module_level(path)
+        return self._module_reach(path)
 
     def old_line(self, path, module, scopes, lineno) -> int:
         function = scopes.function_at(lineno)

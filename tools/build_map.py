@@ -387,6 +387,20 @@ def class_body_self_reads(trees: dict[str, ast.Module]) -> dict[str, str]:
                 key = f"{module}:{qualname}|{cur.id}"
                 parent = parents.get(id(cur))
                 grandparent = parents.get(id(parent)) if parent is not None else None
+                # Skip `ATTR = ATTR.copy()` module-to-class copy in class body.
+                if (
+                    isinstance(parent, ast.Attribute)
+                    and parent.attr == "copy"
+                    and isinstance(grandparent, ast.Call)
+                ):
+                    assign = parents.get(id(grandparent))
+                    if (
+                        isinstance(assign, ast.Assign)
+                        and len(assign.targets) == 1
+                        and isinstance(assign.targets[0], ast.Name)
+                        and assign.targets[0].id == cur.id
+                    ):
+                        continue
                 token = "k" if _is_key_only_use(cur, parent, grandparent) else "*"
                 if found.get(key) != "*":
                     found[key] = token

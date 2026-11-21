@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import sys
@@ -13,6 +14,7 @@ from blast_radius.select import Selection, Selector
 
 
 def main() -> None:
+    gc.disable()
     # Dedicate a private fd to JSON answers and redirect fd 1 -> fd 2 so imported
     # libraries or executed tests can never pollute stdout.
     out_fd = os.dup(1)
@@ -26,6 +28,9 @@ def main() -> None:
     ms_by_number = {t["number"]: round(t["seconds"] * 1000) for t in tests}
 
     impact = ImpactMap(MAP_FILE)
+    cpu_by_number = {
+        t["number"]: impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 1000)) for t in tests
+    }
     selector = Selector(impact)
     numbers = [number_by_id.get(test_id) for test_id in impact.test_ids]
     mapped_ids = set(impact.test_ids)
@@ -46,8 +51,8 @@ def main() -> None:
     if os.environ.get("BR_VERIFY", "1") != "0":
         from blast_radius.verify import plan_verification, verify_batches
 
-        phase1, phase2 = plan_verification(entries, id_by_number, ms_by_number)
-        verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd)
+        phase1, phase2 = plan_verification(entries, id_by_number, ms_by_number, cpu_by_number, numbers)
+        verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd, cpu_by_number)
 
     for commit, chosen, sel in entries:
         final_chosen = verified.get(commit, chosen)
