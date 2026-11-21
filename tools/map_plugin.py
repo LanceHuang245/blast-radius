@@ -1,14 +1,16 @@
 """pytest plugin used only while building the test impact map (never at scoring time).
 
-It records, for every test, three things from one run of sqlglot's suite at the
+It records, for every test, five things from one run of sqlglot's suite at the
 pinned commit:
 
 * line coverage of sqlglot/ and tests/, split by test and phase via coverage
   dynamic contexts ("<nodeid>|setup", "<nodeid>|run", "<nodeid>|teardown",
   "collect|<module nodeid>");
-* which files and directories each test opened or listed (fixture usage);
+* which files and directories each test opened or listed (fixture and source reads);
 * which sqlglot classes each test used (dialects, tokenizers, parsers,
-  generators and expression nodes, with their whole MRO).
+  generators and expression nodes, with their whole MRO);
+* which keys of class-level config dicts each test read by value;
+* which non-dict class attributes on Dialect/Tokenizer/Parser/Generator each test read.
 
 Process pools are replaced by an in-process executor that pickles arguments and
 results the same way a spawned worker would, so work the optimizer and executor
@@ -19,10 +21,13 @@ from __future__ import annotations
 
 import builtins
 import concurrent.futures as cf
+import inspect
 import io
 import json
 import os
 import pickle
+import sys
+from enum import Enum
 
 import coverage
 import pytest
@@ -34,6 +39,10 @@ _cov: coverage.Coverage | None = None
 _ctx = ""
 _opens: dict[str, set[str]] = {}
 _types: dict[str, set[type]] = {}
+_dict_reads: dict[str, set[tuple[int, str]]] = {}
+_dict_meta: list[tuple[type, str]] = []
+_attr_reads: dict[str, set[tuple[type, str]]] = {}
+_tracked_attrs: list[str] = []
 
 
 def _set_ctx(ctx: str) -> None:
@@ -50,8 +59,15 @@ def _note_path(path, kind: str) -> None:
         resolved = os.path.abspath(os.fsdecode(path))
     except Exception:
         return
-    if resolved.startswith(ROOT):
-        _opens.setdefault(_ctx, set()).add(kind + os.path.relpath(resolved, ROOT).replace(os.sep, "/"))
+    if not resolved.startswith(ROOT):
+        return
+    rel = os.path.relpath(resolved, ROOT).replace(os.sep, "/")
+    # Skip Python bytecode caches and pytest reading a test module while collecting it.
+    if "/__pycache__/" in f"/{rel}" or rel.endswith(".pyc"):
+        return
+    if kind == "f:" and _ctx == "collect|" + rel:
+        return
+    _opens.setdefault(_ctx, set()).add(kind + rel)
 
 
 def _wrap_open(original):
@@ -109,7 +125,7 @@ def _record_type(obj) -> None:
 
 def _wrap_method(cls, name: str) -> None:
     original = cls.__dict__.get(name)
-    if original is None or isinstance(original, (staticmethod, classmethod, property)):
+    if not inspect.isfunction(original):
         return
 
     def wrapper(self, *args, **kwargs):
@@ -120,6 +136,134 @@ def _wrap_method(cls, name: str) -> None:
     wrapper.__qualname__ = original.__qualname__
     wrapper.__doc__ = original.__doc__
     setattr(cls, name, wrapper)
+
+
+def _key_str(key) -> str:
+    """Normalize a dict key so runtime lookups match AST-extracted keys."""
+    if isinstance(key, Enum):
+        return f"e:{type(key).__name__}.{key.name}"
+    if isinstance(key, str):
+        return "s:" + key
+    if isinstance(key, type):
+        return "t:" + key.__name__
+    if isinstance(key, int) and not isinstance(key, bool):
+        return f"i:{key}"
+    return "*"
+
+
+class _TrackedDict(dict):
+    """Dict subclass that records value lookups per key and whole-dict value reads."""
+
+    __slots__ = ("_did",)
+
+    def __init__(self, initial: dict, did: int):
+        super().__init__(initial)
+        self._did = did
+
+    def _hit(self, key_token: str) -> None:
+        if _ctx:
+            _dict_reads.setdefault(_ctx, set()).add((self._did, key_token))
+
+    def __getitem__(self, key):
+        self._hit(_key_str(key))
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self._hit(_key_str(key))
+        return super().get(key, default)
+
+    def pop(self, key, *args):
+        self._hit(_key_str(key))
+        return super().pop(key, *args)
+
+    def setdefault(self, key, default=None):
+        self._hit(_key_str(key))
+        return super().setdefault(key, default)
+
+    def values(self):
+        self._hit("*")
+        return super().values()
+
+    def items(self):
+        self._hit("*")
+        return super().items()
+
+    def copy(self):
+        self._hit("*")
+        return super().copy()
+
+    def __eq__(self, other):
+        self._hit("*")
+        return super().__eq__(other)
+
+    def __ne__(self, other):
+        self._hit("*")
+        return super().__ne__(other)
+
+    def __or__(self, other):
+        self._hit("*")
+        return super().__or__(other)
+
+    def __ror__(self, other):
+        self._hit("*")
+        return super().__ror__(other)
+
+    def __repr__(self):
+        self._hit("*")
+        return super().__repr__()
+
+
+class _TrackedAttr:
+    """Non-data descriptor that records per-class reads of class-level data attributes."""
+
+    __slots__ = ("_val", "_name")
+
+    def __init__(self, val, name: str):
+        self._val = val
+        self._name = name
+
+    def __get__(self, obj, objtype=None):
+        if _ctx:
+            actual = type(obj) if obj is not None else objtype
+            if actual is not None:
+                _attr_reads.setdefault(_ctx, set()).add((actual, self._name))
+        return self._val
+
+
+def _all_subclasses(root: type) -> list[type]:
+    seen: list[type] = []
+    stack = [root]
+    visited: set[type] = set()
+    while stack:
+        cls = stack.pop()
+        if cls in visited:
+            continue
+        visited.add(cls)
+        seen.append(cls)
+        stack.extend(cls.__subclasses__())
+    return seen
+
+
+def _instrument_class_attrs(roots: tuple[type, ...]) -> None:
+    """Wrap class dicts and simple data attributes across sqlglot's class hierarchies."""
+    scalar_types = (int, float, bool, str, bytes, type(None), tuple, frozenset, set, list, Enum)
+    seen: set[type] = set()
+    for root in roots:
+        for cls in _all_subclasses(root):
+            if cls in seen or not cls.__module__.startswith("sqlglot"):
+                continue
+            seen.add(cls)
+            ckey = _class_key(cls)
+            for name, val in list(cls.__dict__.items()):
+                if name.startswith("_") or name in ("classes",):
+                    continue
+                if type(val) is dict and not name.endswith("_TRIE"):
+                    did = len(_dict_meta)
+                    _dict_meta.append((cls, name))
+                    setattr(cls, name, _TrackedDict(val, did))
+                elif isinstance(val, scalar_types) and not callable(val):
+                    _tracked_attrs.append(f"{ckey}|{name}")
+                    setattr(cls, name, _TrackedAttr(val, name))
 
 
 def _instrument_sqlglot() -> None:
@@ -135,9 +279,27 @@ def _instrument_sqlglot() -> None:
     _wrap_method(parser.Parser, "parse_into")
     _wrap_method(generator.Generator, "__init__")
     _wrap_method(generator.Generator, "generate")
-    for name in ("__init__", "parse", "parse_into", "generate", "transpile", "tokenize",
-                 "tokenizer", "jsonpath_tokenizer", "parser", "generator"):
-        _wrap_method(dialect.Dialect, name)
+
+    # Wrap every public instance method on Dialect plus __init__ so cached dialect
+    # instances still attribute every dialect method call to the active test.
+    for name in list(dialect.Dialect.__dict__):
+        if name == "__init__" or not name.startswith("_"):
+            _wrap_method(dialect.Dialect, name)
+
+    # Also record cached Dialect instances returned by Dialect.get_or_raise.
+    orig_get_or_raise = dialect.Dialect.__dict__.get("get_or_raise")
+    if isinstance(orig_get_or_raise, classmethod):
+        fn = orig_get_or_raise.__func__
+
+        def wrapped_get_or_raise(cls, *args, **kwargs):
+            result = fn(cls, *args, **kwargs)
+            if isinstance(result, dialect.Dialect):
+                _record_type(result)
+            return result
+
+        dialect.Dialect.get_or_raise = classmethod(wrapped_get_or_raise)
+
+    _instrument_class_attrs((dialect.Dialect, tokens.Tokenizer, parser.Parser, generator.Generator))
 
 
 def pytest_configure(config):
@@ -174,8 +336,8 @@ def _import_everything() -> None:
         if info.name != "sqlglot.__main__":
             try:
                 importlib.import_module(info.name)
-            except Exception:
-                pass
+            except Exception as err:
+                print(f"map_plugin: failed to import {info.name}: {err}", file=sys.stderr)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -220,12 +382,47 @@ def pytest_unconfigure(config):
         return
     _cov.stop()
     _cov.save()
+
     used = {
         ctx: sorted({_class_key(c) for t in types for c in t.__mro__ if c.__module__.startswith("sqlglot")})
         for ctx, types in _types.items()
     }
+
+    # Propagate dict key reads up MRO to ancestor classes defining the same dict attribute.
+    dict_usage: dict[str, list[str]] = {}
+    for ctx, pairs in _dict_reads.items():
+        expanded: set[str] = set()
+        for did, key_tok in pairs:
+            cls, attr = _dict_meta[did]
+            for base in cls.__mro__:
+                if base.__module__.startswith("sqlglot") and attr in base.__dict__:
+                    expanded.add(f"{_class_key(base)}|{attr}|{key_tok}")
+        if expanded:
+            dict_usage[ctx] = sorted(expanded)
+
+    # Propagate scalar/data attribute reads up MRO to ancestor classes defining that attribute.
+    attr_usage: dict[str, list[str]] = {}
+    for ctx, pairs in _attr_reads.items():
+        expanded_attrs: set[str] = set()
+        for cls, attr in pairs:
+            for base in cls.__mro__:
+                if base.__module__.startswith("sqlglot") and attr in base.__dict__:
+                    expanded_attrs.add(f"{_class_key(base)}|{attr}")
+        if expanded_attrs:
+            attr_usage[ctx] = sorted(expanded_attrs)
+
+    tracked_dicts = sorted({f"{_class_key(cls)}|{attr}" for cls, attr in _dict_meta})
+
     with open(os.path.join(OUT, "usage.json"), "w") as handle:
         json.dump(
-            {"opens": {k: sorted(v) for k, v in _opens.items()}, "classes": used, "outcomes": _outcomes},
+            {
+                "opens": {k: sorted(v) for k, v in _opens.items()},
+                "classes": used,
+                "dict_reads": dict_usage,
+                "tracked_dicts": tracked_dicts,
+                "attr_reads": attr_usage,
+                "tracked_attrs": sorted(set(_tracked_attrs)),
+                "outcomes": _outcomes,
+            },
             handle,
         )

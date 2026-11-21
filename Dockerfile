@@ -9,8 +9,9 @@ RUN mkdir -p /app/sqlglot-src \
     && tar -xzf /tmp/sqlglot.tar.gz -C /app/sqlglot-src --strip-components=1 \
     && rm /tmp/sqlglot.tar.gz
 
-COPY selector.py /app/selector.py
+COPY blast_radius/ /app/blast_radius/
 COPY map/ /app/map/
-RUN chmod -R a+rX /app
+RUN python -m compileall -q /app/blast_radius && chmod -R a+rX /app
 
-CMD ["python", "/app/selector.py"]
+WORKDIR /app
+CMD ["python", "-m", "blast_radius"]
