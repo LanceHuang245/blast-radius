@@ -6,7 +6,9 @@ import ast
 import marshal
 from dataclasses import dataclass, field
 
-from blast_radius import SOURCE, Everything
+import os
+
+from blast_radius import APP, SOURCE, Everything, log
 from blast_radius.impact_map import ImpactMap, module_name
 from blast_radius.import_state import STATE_FILE
 from blast_radius.patches import FilePatch, apply, change_blocks, parse_patch
@@ -232,6 +234,12 @@ class Selector:
         self._spans_ok: bool = True
         self._owner_checks: set[str] = set()
         self._state = marshal.loads(STATE_FILE.read_bytes()) if STATE_FILE.is_file() else None
+        self.values = None
+        values_file = APP / "map" / "values.bin"
+        if values_file.is_file() and os.environ.get("BR_VALUES", "1") != "0":
+            from blast_radius.values import ValueMap
+
+            self.values = ValueMap(values_file, impact.test_ids)
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
         self.docs_mask = sum(1 << i for i in docs)
 
@@ -473,8 +481,23 @@ class Selector:
         module = module_name(path)
         mask = 0
         self._coarse_block = False
+        owners_before = set(self._owner_checks)
         for removed, added in blocks:
             mask |= self.select_block(path, module, old_scopes, new_scopes, removed, added, ignore_ann)
+
+        if self.values is not None and path.startswith("sqlglot/"):
+            # Every difference is a rearranged condition over the same operands: replay the
+            # pinned run's recorded outcomes (import-time ones included) through the edit.
+            try:
+                vmask = self.values.narrow(path, old_scopes.tree, new_tree, self.impact, hunks)
+            except Exception as error:  # noqa: BLE001 - fall back to the rules above
+                log(f"value map error on {path}: {type(error).__name__}: {error}")
+                vmask = None
+            if vmask is not None:
+                log(f"{path}: value map narrows {bin(mask).count('1')} -> {bin(vmask).count('1')} tests")
+                mask = vmask
+                self._owner_checks = owners_before
+                self._coarse_block = False
 
         targets: list[tuple[str, str]] | None = None
         attr_targets: list[tuple[str, str, str, object]] | None = None

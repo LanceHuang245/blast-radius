@@ -13,7 +13,7 @@ RUN_FLAGS := --rm --platform linux/amd64 --network none --cpus 2 \
 	--volume $(SAMPLE)/commits:/data/commits:ro \
 	--volume $(SAMPLE)/tests.json:/data/tests.json:ro
 
-.PHONY: build sample check map
+.PHONY: build sample check map values
 
 build:
 	docker build --platform linux/amd64 --tag $(IMAGE) .
@@ -45,3 +45,17 @@ map:
 		-v $(CURDIR)/tools:/tools:ro -v $(CURDIR)/.cache/mapout:/out \
 		-v $(SAMPLE)/tests.json:/tests.json:ro -v $(CURDIR)/map:/map $(MAP_IMAGE) \
 		python /tools/build_map.py /src /out /tests.json /map/impact.json.gz
+
+# Rebuilds map/values.bin (condition-outcome map) from sqlglot at the pinned commit: runs its
+# whole suite under tools/value_plugin.py in parallel shards, then folds the shards with
+# tools/build_values.py. Needs .cache/sqlglot (the pinned checkout) and the map image.
+values:
+	docker build --platform linux/amd64 -f tools/Dockerfile.map --tag $(MAP_IMAGE) .
+	rm -rf .cache/valout && mkdir -p .cache/valout
+	docker run --rm --platform linux/amd64 -v $(CURDIR)/.cache/sqlglot:/src:ro \
+		-v $(CURDIR)/tools:/tools:ro -v $(CURDIR):/repo:ro -v $(CURDIR)/.cache/valout:/out \
+		-v $(SAMPLE)/tests.json:/tests.json:ro -w /src -e PYTHONPATH=/src:/tools -e MAP_OUT=/out \
+		-e SKIP_INTEGRATION=0 -e SKIP_IDS=tests/test_parser.py::TestParser::test_max_nodes $(MAP_IMAGE) \
+		sh -c 'python /tools/run_values.py 10 & python /tools/run_values_ids.py 8 x tests/test_parser.py tests/test_optimizer.py; wait'
+	docker run --rm --platform linux/amd64 -v $(CURDIR):/w -w /w $(MAP_IMAGE) \
+		python tools/build_values.py .cache/valout sample/tests.json map/values.bin

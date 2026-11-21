@@ -18,6 +18,12 @@ How a patch is mapped to tests:
 * Other class-level edits select tests that used or statically referenced that
   class plus lines inside that class. Module-level edits propagate through both
   eager and lazy import graphs.
+* An edit that only rearranges a condition (and/or swapped, `not` moved, a
+  comparison operator changed) over the same operands is replayed against the
+  value map (map/values.bin, built by tools/value_plugin.py from one run of the
+  pinned suite): it records, per test, the truth of every and/or/not operand and
+  every comparison relation each condition site produced. Only tests for which
+  the edited condition would evaluate differently stay selected.
 * Anything the map cannot explain selects every test.
 """
 
