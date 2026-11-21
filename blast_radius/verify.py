@@ -24,6 +24,7 @@ import importlib.abc
 import importlib.machinery
 import inspect
 import io
+import marshal
 import os
 import pickle
 import select
@@ -42,7 +43,6 @@ from blast_radius.select import Selection
 from blast_radius.tpc_verify import (
     TPC_EST_CPU_MS,
     TPC_SUITE_BY_TEST_ID,
-    _can_skip_tpc_optimize,
     select_tpc_mode,
     verify_generator_memory,
     verify_lazy_athena_presto,
@@ -52,8 +52,8 @@ from blast_radius.tpc_verify import (
 )
 
 # Decision thresholds (overridable via env vars for local A/B benchmarking).
-MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "2500"))
-MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "2500"))
+MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "6000"))
+MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "6000"))
 MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "350"))
 MIN_DECAP_GAIN_MS = int(os.environ.get("BR_MIN_DECAP_GAIN_MS", "600"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
@@ -260,14 +260,57 @@ def _install_open_overlay(patched_files: dict[str, str]) -> None:
     io.open = patched_open
 
 
+def import_state_digests(patched_files: dict[str, str], names: list[str]) -> dict[str, str | None]:
+    """Import every sqlglot module with the patch in a forked child and digest `names`
+    (see blast_radius.import_state). Empty if the child fails."""
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        payload = marshal.dumps({})
+        try:
+            signal.alarm(30)
+            os.chdir(SOURCE)
+            sys.path.insert(0, str(SOURCE))
+            sys.meta_path.insert(0, _OverlayFinder(patched_files))
+            _install_open_overlay(patched_files)
+            from blast_radius.import_state import import_all_sqlglot, module_digest
+
+            import_all_sqlglot()
+            payload = marshal.dumps({name: module_digest(name) for name in names})
+        except BaseException:
+            pass
+        finally:
+            os.write(w_fd, payload)
+            os._exit(0)
+    os.close(w_fd)
+    chunks = []
+    while chunk := os.read(r_fd, 65536):
+        chunks.append(chunk)
+    os.close(r_fd)
+    os.waitpid(pid, 0)
+    return marshal.loads(b"".join(chunks))
+
+
+def check_import_state(patched_files: dict[str, str], owners: list[str]) -> bool:
+    """True iff every owner's import-time state digest under the patch equals the pinned one."""
+    from blast_radius.import_state import STATE_FILE
+
+    expected = marshal.loads(STATE_FILE.read_bytes())["digests"]
+    got = import_state_digests(patched_files, owners)
+    return all(name in expected and got.get(name) == expected[name] for name in owners)
+
+
 def _find_unique_code(parent_code: types.CodeType, steps: list[str]) -> types.CodeType | None:
     """Walk nested co_consts to locate the unique compiled CodeType for `qualname`."""
     cur = parent_code
-    for name in steps:
+    for depth, name in enumerate(steps):
         matches = [c for c in cur.co_consts if isinstance(c, types.CodeType) and c.co_name == name]
-        if len(matches) != 1:
+        if not matches or (len(matches) > 1 and depth < len(steps) - 1):
             return None
-        cur = matches[0]
+        # Several defs of the function itself are @overload stubs plus the real def, which comes
+        # last and is the one bound at runtime (the selector only allows that shape).
+        cur = max(matches, key=lambda c: c.co_firstlineno)
     return cur
 
 
@@ -476,10 +519,7 @@ def _est_test_cpu_ms(
 ) -> int:
     """Return best realistic CPU estimate (ms) for verifying test `num` on `sel`."""
     if tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
-        suite = TPC_SUITE_BY_TEST_ID[tid]
-        if tpc_mode == "fast_a" and _can_skip_tpc_optimize(sel.patched_files):
-            return 450 if suite == "tpcds" else 120
-        return TPC_EST_CPU_MS[(suite, tpc_mode)]
+        return TPC_EST_CPU_MS[(TPC_SUITE_BY_TEST_ID[tid], tpc_mode)]
     if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
         return 100
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
@@ -659,7 +699,7 @@ def _start_child_verification(
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
                 signal.alarm(65)
                 try:
-                    return verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode, sel.patched_files)
+                    return verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode)
                 except BaseException:
                     return False
                 finally:
@@ -1134,13 +1174,13 @@ def _run_batch_parallel(
             return
         lines = raw.split(b"\n")
         passed_set = {int(line[2:]) for line in lines if line.startswith(b"P ")}
-        n_failed = sum(1 for line in lines if line.startswith(b"F "))
+        failed_ids = [id_by_number[int(line[2:])].split("::")[-1] for line in lines if line.startswith(b"F ")]
         mtag = f" tpc={task.tpc_mode}" if task.tpc_mode else ""
         dtag = f" decap={len(task.decap_targets)}" if task.decap_targets else ""
         end = " TIMEOUT" if timed_out else ("" if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else f" status={status}")
         log(
             f"{task.commit}: p{task.phase}{mtag}{dtag} cpu={child_cpu:.3f}s "
-            f"pass={len(passed_set)} fail={n_failed}/{len(task.chosen)}{end}"
+            f"pass={len(passed_set)} fail={len(failed_ids)}/{len(task.chosen)}{end} failed={failed_ids[:5]}"
         )
         verified[task.commit] = task.chosen - passed_set
 
@@ -1157,7 +1197,11 @@ def _run_batch_parallel(
                 queue.clear()
                 break
             task = queue.pop(0)
-            limit_s = min(CHILD_LIMIT_BASE_S + CHILD_LIMIT_FACTOR * task.est_cpu_ms / 1000, remaining)
+            limit_cpu_ms = task.est_cpu_ms
+            if task.tpc_mode == "fast_a" and any(id_by_number[n] in TPC_SUITE_BY_TEST_ID for n in task.decap_targets):
+                # fast_a re-executes the queries whose plans changed, up to a full_cached run.
+                limit_cpu_ms += TPC_EST_CPU_MS[("tpcds", "full_cached")]
+            limit_s = min(CHILD_LIMIT_BASE_S + CHILD_LIMIT_FACTOR * limit_cpu_ms / 1000, remaining)
             pid, r_fd = _start_child_verification(task, id_by_number, ms_by_number, cpu_by_number, out_fd)
             active[r_fd] = (pid, task, time.monotonic() + limit_s, [])
 

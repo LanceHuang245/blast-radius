@@ -40,6 +40,17 @@ def main() -> None:
     entries: list[tuple[str, set[int], Selection]] = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         sel = selector.select_detailed(patch.read_text(encoding="utf-8", errors="replace"))
+        if sel.import_checks:
+            # An edited statement ran during other modules' imports: keep the narrow selection
+            # only if those modules build the same import-time state under the patch.
+            from blast_radius.verify import check_import_state
+
+            same = os.environ.get("BR_VERIFY", "1") != "0" and check_import_state(sel.patched_files, sel.import_checks)
+            log(f"{patch.stem}: import state of {sel.import_checks} {'unchanged' if same else 'CHANGED'}")
+            if not same:
+                sel.mask, sel.lazy_pp_mask = sel.coarse_mask, 0
+                # Import-time state differs: a pre-warmed import would be stale.
+                sel.hot_patch_targets, sel.attr_hot_targets = None, None
         chosen = {numbers[i] for i in range(len(numbers)) if sel.mask >> i & 1 and numbers[i] is not None}
         if unmapped and sel.reason != "noop":
             chosen.update(unmapped)

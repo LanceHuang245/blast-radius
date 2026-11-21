@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+import marshal
+from dataclasses import dataclass, field
 
 from blast_radius import SOURCE, Everything
 from blast_radius.impact_map import ImpactMap, module_name
+from blast_radius.import_state import STATE_FILE
 from blast_radius.patches import FilePatch, apply, change_blocks, parse_patch
 from blast_radius.scopes import (
     COMPOUND_NODES,
@@ -39,10 +41,28 @@ class Selection:
     fixture_only: bool = False
     # Bitmask of tests in `mask` pulled in solely by pushdown_predicates.py:36-37 lazy imports.
     lazy_pp_mask: int = 0
+    # Modules whose import ran an edited statement: `mask` holds only if their import-time
+    # state digests are unchanged under the patch, else `coarse_mask` applies.
+    import_checks: list[str] = field(default_factory=list)
+    coarse_mask: int = 0
 
 
 def _decorator_name(node: ast.expr) -> str | None:
     return node.id if isinstance(node, ast.Name) else None
+
+
+def _is_overload(node: ast.expr) -> bool:
+    return (isinstance(node, ast.Name) and node.id == "overload") or (
+        isinstance(node, ast.Attribute) and node.attr == "overload"
+    )
+
+
+def _runtime_def(scopes: Scopes, qualname: str):
+    """The def a qualname is bound to at runtime: the only one, or the last after @overload stubs."""
+    defs = [f for f in scopes.functions if f[3] == qualname]
+    if not defs or not all(any(_is_overload(d) for d in f[4].decorator_list) for f in defs[:-1]):
+        return None
+    return defs[-1]
 
 
 def _matching_compound_subblocks(
@@ -159,10 +179,8 @@ def _extract_hot_patch_targets(
             body_start, end, _head, qual, old_node = fn
             if "<locals>" in qual or runs_at_import(path, body_start, end):
                 return None
-            if len(old_scopes.by_qualname.get(qual, ())) != 1 or len(new_scopes.by_qualname.get(qual, ())) != 1:
-                return None
-            new_fn = next((f for f in new_scopes.functions if f[3] == qual), None)
-            if new_fn is None:
+            old_rt, new_fn = _runtime_def(old_scopes, qual), _runtime_def(new_scopes, qual)
+            if old_rt is None or old_rt[4] is not old_node or new_fn is None:
                 return None
             new_node = new_fn[4]
             if not all(_decorator_name(d) in SAFE_HOTPATCH_DECORATORS for d in old_node.decorator_list):
@@ -180,9 +198,9 @@ def _extract_hot_patch_targets(
             _body_start, _end, _head, qual, new_node = fn
             if "<locals>" in qual:
                 return None
-            if len(old_scopes.by_qualname.get(qual, ())) != 1 or len(new_scopes.by_qualname.get(qual, ())) != 1:
+            old_fn, new_rt = _runtime_def(old_scopes, qual), _runtime_def(new_scopes, qual)
+            if new_rt is None or new_rt[4] is not new_node:
                 return None
-            old_fn = next((f for f in old_scopes.functions if f[3] == qual), None)
             if old_fn is None or runs_at_import(path, old_fn[0], old_fn[1]):
                 return None
             old_node = old_fn[4]
@@ -202,6 +220,10 @@ class Selector:
         self._old: dict[str, tuple[str, Scopes]] = {}
         self._no_pp_lazy: bool = False
         self._hit_pp_lazy: bool = False
+        self._coarse_block: bool = False
+        self._no_import_check: bool = False
+        self._owner_checks: set[str] = set()
+        self._state = marshal.loads(STATE_FILE.read_bytes()) if STATE_FILE.is_file() else None
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
         self.docs_mask = sum(1 << i for i in docs)
 
@@ -232,6 +254,7 @@ class Selector:
             hot_targets: list[tuple[str, str]] | None = []
             attr_targets: list[tuple[str, str, str, object]] | None = []
             self._hit_pp_lazy = False
+            self._owner_checks = set()
             for file_patch in files:
                 file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets = self.select_file_detailed(
                     file_patch, patched_files
@@ -257,6 +280,16 @@ class Selector:
                     lazy_pp_mask = mask & ~mask_no_pp
                 finally:
                     self._no_pp_lazy = False
+            owners = sorted(self._owner_checks)
+            coarse_mask = 0
+            if owners:
+                self._no_import_check = True
+                try:
+                    for file_patch in files:
+                        fm, _, _, _, _ = self.select_file_detailed(file_patch, {})
+                        coarse_mask |= fm
+                finally:
+                    self._no_import_check = False
             reason = "noop" if all_noop and mask == 0 else "mapped"
             return Selection(
                 mask=mask,
@@ -266,6 +299,8 @@ class Selector:
                 attr_hot_targets=attr_targets,
                 fixture_only=all_fixture_or_noop and not all_noop,
                 lazy_pp_mask=lazy_pp_mask,
+                import_checks=owners,
+                coarse_mask=coarse_mask,
             )
         except Everything as reason:
             return Selection(impact.everything, f"everything ({reason})", {}, None, None, False)
@@ -379,13 +414,18 @@ class Selector:
 
         module = module_name(path)
         mask = 0
+        self._coarse_block = False
         for removed, added in blocks:
             mask |= self.select_block(path, module, old_scopes, new_scopes, removed, added, ignore_ann)
 
         targets: list[tuple[str, str]] | None = None
         attr_targets: list[tuple[str, str, str, object]] | None = None
         if path.startswith("sqlglot/"):
-            targets = _extract_hot_patch_targets(path, old_scopes, new_scopes, hunks, self.runs_before_tests)
+            # Every block resolved per statement means no edited statement ran before the tests, or
+            # only in imports whose built state the runtime proves unchanged: either way, swapping
+            # __code__ after a pre-warmed import matches importing the patched module.
+            ran_before = self.runs_before_tests if self._coarse_block else (lambda *_: False)
+            targets = _extract_hot_patch_targets(path, old_scopes, new_scopes, hunks, ran_before)
             if targets is None:
                 attr_targets = _extract_attr_hot_targets(path, module, old_scopes, new_scopes, hunks, self.impact)
         return mask, False, new_text, targets, attr_targets
@@ -429,6 +469,7 @@ class Selector:
         if ast_mask is not None:
             return ast_mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
 
+        self._coarse_block = True
         mask = 0
         for lineno, _ in removed:
             mask |= self.old_line(path, module, old_scopes, lineno)
@@ -589,7 +630,6 @@ class Selector:
         return None
 
     def statement_level(self, path, old_scopes, new_scopes, removed, added):
-        impact = self.impact
         mask = 0
         checked_funcs: set[str] = set()
         old_lines = {n for n, _ in removed}
@@ -604,8 +644,6 @@ class Selector:
             body_start, end, head, qualname, old_node = function
             if old_no < body_start:
                 return None  # def header or decorator
-            if self.runs_at_import(path, body_start, end):
-                return None
             # Reject statement-level only if non-local lexical bindings or generator flags changed.
             if qualname not in checked_funcs:
                 if not same_local_binding_semantics(old_node, new_function[4], old_lines, new_lines):
@@ -623,8 +661,45 @@ class Selector:
                 if old_no > last:
                     return None  # else:/finally: lines and the like
                 stop = last
-            mask |= impact.span(path, start, stop)
+            span = self._test_time_span(path, start, stop)
+            if span is None:
+                return None
+            mask |= span
         return mask
+
+    def _test_time_span(self, path: str, first: int, last: int) -> int | None:
+        """Tests that ran an edited statement, or None if it also ran while importing/collecting.
+
+        The map imports every sqlglot module before any test, so a statement that never ran
+        then only ever ran inside tests, and is credited to them. Execution only diverges
+        once it reaches an edited statement: if that never happened at import or collection
+        time, import-time state is unchanged even when the enclosing function ran then.
+        """
+        if self.runs_before_tests(path, first, last):
+            owners = self._import_owners(path, first, last)
+            if owners is None:
+                return None
+            # Ran while other modules imported: tests only see that through the state those
+            # imports built, which the runtime re-checks (else the coarse selection is used,
+            # and hot-patching is dropped).
+            self._owner_checks |= owners
+        return self.impact.span(path, first, last)
+
+    def _import_owners(self, path: str, first: int, last: int) -> set[str] | None:
+        """Modules whose import ran these lines, if all have a recorded state digest; else None."""
+        if self._no_import_check or not self._state:
+            return None
+        if any(first <= n <= last for n in self.impact.collect_lines.get(path, ())):
+            return None
+        per_line = self._state["owners"].get(path, {})
+        owners: set[str] = set()
+        for n in self.impact.import_lines.get(path, ()):
+            if first <= n <= last:
+                names = per_line.get(n)
+                if not names or any(name not in self._state["digests"] for name in names):
+                    return None
+                owners.update(names)
+        return owners
 
     def ast_statement_level(
         self,
@@ -661,18 +736,14 @@ class Selector:
                 new_fn = fn
         if qualname is None:
             return None
-        if len(old_scopes.by_qualname.get(qualname, ())) != 1 or len(new_scopes.by_qualname.get(qualname, ())) != 1:
+        old_rt, new_rt = _runtime_def(old_scopes, qualname), _runtime_def(new_scopes, qualname)
+        if old_rt is None or new_rt is None:
             return None
-        if old_fn is None:
-            old_fn = next((f for f in old_scopes.functions if f[3] == qualname), None)
-        if new_fn is None:
-            new_fn = next((f for f in new_scopes.functions if f[3] == qualname), None)
-        if old_fn is None or new_fn is None:
+        if (old_fn is not None and old_fn[4] is not old_rt[4]) or (new_fn is not None and new_fn[4] is not new_rt[4]):
             return None
-        body_start, end, _head, _q, old_node = old_fn
+        old_fn, new_fn = old_rt, new_rt
+        old_node = old_fn[4]
         new_node = new_fn[4]
-        if self.runs_at_import(path, body_start, end):
-            return None
         old_lines = {n for n, _ in removed}
         new_lines = {n for n, _, _ in added}
         if not same_local_binding_semantics(old_node, new_node, old_lines, new_lines):
@@ -687,7 +758,6 @@ class Selector:
         ignore_ann: bool,
     ) -> int | None:
         """Return coverage mask for the minimal changed statements/sub-blocks between two statement lists."""
-        impact = self.impact
         old_c = [canon_ast(s, ignore_ann) for s in old_stmts]
         new_c = [canon_ast(s, ignore_ann) for s in new_stmts]
 
@@ -717,7 +787,7 @@ class Selector:
             if sib is None:
                 return None
             stop = header_end(sib) if isinstance(sib, COMPOUND_NODES) else sib.end_lineno
-            return impact.span(path, sib.lineno, stop)
+            return self._test_time_span(path, sib.lineno, stop)
 
         # Single compound statement edited in place: recurse into sub-blocks if its header is unchanged.
         if len(mid_old) == 1 and len(mid_new) == 1 and type(mid_old[0]) is type(mid_new[0]):
@@ -728,19 +798,22 @@ class Selector:
                 for bo, bn in sub_pairs:
                     sub_mask = self._diff_stmt_lists(path, bo, bn, ignore_ann)
                     if sub_mask is None:
-                        return impact.span(path, so.lineno, so.end_lineno)
+                        return self._test_time_span(path, so.lineno, so.end_lineno)
                     mask |= sub_mask
                 return mask
             # Only the compound header changed while all sub-blocks are identical.
             if isinstance(so, COMPOUND_NODES) and _same_compound_bodies(so, sn, ignore_ann):
-                return impact.span(path, so.lineno, header_end(so))
+                return self._test_time_span(path, so.lineno, header_end(so))
 
         mask = 0
         for s in mid_old:
             if _is_docstring(s):
                 mask |= self.docs_mask
-            else:
-                mask |= impact.span(path, s.lineno, s.end_lineno)
+                continue
+            span = self._test_time_span(path, s.lineno, s.end_lineno)
+            if span is None:
+                return None
+            mask |= span
         return mask
 
     def runs_at_import(self, path: str, first: int, last: int) -> bool:

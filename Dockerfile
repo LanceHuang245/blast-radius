@@ -23,7 +23,9 @@ COPY blast_radius/impact_map.py blast_radius/precompile.py /app/blast_radius/
 RUN PYTHONPATH=/app python -m blast_radius.precompile
 
 COPY blast_radius/ /app/blast_radius/
-RUN python -m compileall -q /app/blast_radius \
+# Which module's import runs each sqlglot line, and digests of what those imports build.
+RUN PYTHONPATH=/app python -m blast_radius.import_state \
+    && python -m compileall -q /app/blast_radius \
     && chmod -R a+rX /app/blast_radius /app/map
 
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1

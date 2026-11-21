@@ -1,0 +1,225 @@
+"""Import-time state of sqlglot modules: who runs which lines at import, and a digest of what it built.
+
+Some sqlglot modules parse SQL while importing (generators/duckdb.py builds expression constants
+with exp.maybe_parse), so parser and tokenizer statements run before any test. An edit to such a
+statement can only change the tests' world through the state those imports leave behind. This
+module records, at build time, which module's import ("owner") runs each line, and a digest of
+each owner's data; at run time the patched owners are imported again and their digests compared.
+
+Build: python -m blast_radius.import_state   (writes map/import_state.marshal)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import marshal
+import os
+import subprocess
+import sys
+import types
+from collections import defaultdict
+
+from blast_radius import APP, SOURCE
+
+STATE_FILE = APP / "map" / "import_state.marshal"
+
+
+class Undigestable(Exception):
+    """A value whose content cannot be compared deterministically."""
+
+
+def _digest_value(value, owner: str, seen: set[int], out: list[str]) -> None:
+    from sqlglot import exp
+    from sqlglot.serde import dump
+
+    if value is None or isinstance(value, (str, bytes, int, float, bool, complex)):
+        out.append(repr(value))
+    elif isinstance(value, exp.Expr):
+        out.append("E" + repr(dump(value)))
+    elif isinstance(value, (tuple, list)):
+        out.append(type(value).__name__ + "[")
+        for item in value:
+            _digest_value(item, owner, seen, out)
+        out.append("]")
+    elif isinstance(value, (set, frozenset)):
+        parts = []
+        for item in value:
+            sub: list[str] = []
+            _digest_value(item, owner, seen, sub)
+            parts.append("".join(sub))
+        out.append("{" + ",".join(sorted(parts)) + "}")
+    elif isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            sub: list[str] = []
+            _digest_value(key, owner, seen, sub)
+            sub.append(":")
+            _digest_value(item, owner, seen, sub)
+            parts.append("".join(sub))
+        out.append("{" + ",".join(sorted(parts)) + "}")
+    elif isinstance(value, (staticmethod, classmethod)):
+        _digest_value(value.__func__, owner, seen, out)
+    elif isinstance(value, property):
+        for fn in (value.fget, value.fset, value.fdel):
+            _digest_value(fn, owner, seen, out)
+    elif isinstance(value, types.FunctionType):
+        # Code is unaffected by import-time parsing; what import built is in defaults and closures.
+        out.append("F" + value.__qualname__)
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        _digest_value(value.__defaults__, owner, seen, out)
+        _digest_value(value.__kwdefaults__, owner, seen, out)
+        for cell in value.__closure__ or ():
+            try:
+                _digest_value(cell.cell_contents, owner, seen, out)
+            except ValueError:  # empty cell
+                out.append("<empty>")
+    elif isinstance(value, type):
+        out.append("T" + value.__module__ + "." + value.__qualname__)
+        # Only classes defined by the owner hold state its import built.
+        if value.__module__ == owner and id(value) not in seen:
+            seen.add(id(value))
+            for key in sorted(value.__dict__):
+                if key in ("__dict__", "__weakref__", "__doc__", "__module__"):
+                    continue
+                out.append(key + "=")
+                _digest_value(value.__dict__[key], owner, seen, out)
+    elif isinstance(value, (types.ModuleType, types.BuiltinFunctionType, types.MethodDescriptorType)):
+        out.append("M" + getattr(value, "__name__", ""))
+    elif isinstance(value, types.MethodType):
+        out.append("B" + value.__qualname__)
+        _digest_value(value.__func__, owner, seen, out)
+    elif isinstance(value, (types.MemberDescriptorType, types.GetSetDescriptorType)):
+        out.append("D" + value.__name__)
+    elif hasattr(value, "name") and hasattr(value, "value") and type(value).__module__.startswith("sqlglot"):
+        out.append(repr(value))  # enum members
+    elif type(value).__module__.startswith("sqlglot"):
+        # Other sqlglot objects (dialect/tokenizer instances, tries, ...): compare their attributes.
+        if id(value) in seen:
+            out.append("<seen>")
+            return
+        seen.add(id(value))
+        out.append("O" + type(value).__qualname__)
+        attrs = dict(vars(value)) if hasattr(value, "__dict__") else {}
+        for cls in type(value).__mro__:
+            for slot in getattr(cls, "__slots__", ()):
+                if hasattr(value, slot):
+                    attrs[slot] = getattr(value, slot)
+        _digest_value(attrs, owner, seen, out)
+    else:
+        # Typing constructs, __future__ features and the like: a repr without an address is stable.
+        text = repr(value)
+        if " at 0x" in text:
+            raise Undigestable(f"{owner}: {type(value).__module__}.{type(value).__qualname__}")
+        out.append(text)
+
+
+def module_digest(name: str) -> str | None:
+    """Digest of a module's globals (and of the classes it defines), or None if not digestable."""
+    module = sys.modules.get(name)
+    if module is None:
+        return None
+    out: list[str] = []
+    try:
+        for key in sorted(vars(module)):
+            if key.startswith("__"):
+                continue
+            out.append(key + "=")
+            _digest_value(vars(module)[key], name, set(), out)
+    except (Undigestable, RecursionError):
+        return None
+    return hashlib.blake2b("\n".join(out).encode(), digest_size=16).hexdigest()
+
+
+def import_all_sqlglot() -> None:
+    """Import every sqlglot module, the way the coverage map does before any test."""
+    import importlib
+    import pkgutil
+
+    import sqlglot
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name != "sqlglot.__main__":
+            try:
+                importlib.import_module(info.name)
+            except Exception:
+                pass
+
+
+def main() -> None:
+    """Record line owners and owner digests at the pinned commit."""
+    src_prefix = str(SOURCE.resolve()) + "/"
+    owners: dict[str, dict[int, set[str]]] = defaultdict(lambda: defaultdict(set))
+
+    def tracer(frame, event, _arg):
+        filename = frame.f_code.co_filename
+        if not filename.startswith(src_prefix):
+            return None
+        rel = filename[len(src_prefix) :]
+        if not rel.startswith("sqlglot/"):
+            return None
+
+        def local(frame, event, _arg):
+            if event == "line":
+                f = frame
+                while f is not None and f.f_code.co_name != "<module>":
+                    f = f.f_back
+                if f is not None:
+                    owners[rel][frame.f_lineno].add(f.f_globals.get("__name__", ""))
+            return local
+
+        return local
+
+    sys.path.insert(0, str(SOURCE))
+    sys.settrace(tracer)
+    try:
+        import_all_sqlglot()
+    finally:
+        sys.settrace(None)
+
+    owner_names = sorted({o for per_line in owners.values() for names in per_line.values() for o in names})
+    digests = {name: module_digest(name) for name in owner_names}
+    # Keep only digests that also come out the same in fresh processes with other hash seeds.
+    for seed in ("1", "2"):
+        other = marshal.loads(
+            subprocess.run(
+                [sys.executable, "-m", "blast_radius.import_state", "--digests", *owner_names],
+                env={**os.environ, "PYTHONHASHSEED": seed},
+                capture_output=True,
+                check=True,
+            ).stdout
+        )
+        digests = {name: d for name, d in digests.items() if d is not None and other.get(name) == d}
+    # And the same in the runtime checker itself, from a fresh process (no sqlglot imported yet).
+    runtime = marshal.loads(
+        subprocess.run(
+            [sys.executable, "-m", "blast_radius.import_state", "--runtime", *sorted(digests)],
+            capture_output=True,
+            check=True,
+        ).stdout
+    )
+    digests = {name: d for name, d in digests.items() if runtime.get(name) == d}
+    data = {
+        "owners": {rel: {ln: sorted(names) for ln, names in per.items()} for rel, per in owners.items()},
+        "digests": digests,
+    }
+    STATE_FILE.write_bytes(marshal.dumps(data))
+    print(
+        f"import state: {sum(len(v) for v in owners.values())} lines, {len(owner_names)} owners, "
+        f"{len(data['digests'])} digestable",
+        file=sys.stderr,
+    )
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["--digests"]:
+        sys.path.insert(0, str(SOURCE))
+        import_all_sqlglot()
+        sys.stdout.buffer.write(marshal.dumps({name: module_digest(name) for name in sys.argv[2:]}))
+    elif sys.argv[1:2] == ["--runtime"]:
+        from blast_radius.verify import import_state_digests
+
+        sys.stdout.buffer.write(marshal.dumps(import_state_digests({}, sys.argv[2:])))
+    else:
+        main()

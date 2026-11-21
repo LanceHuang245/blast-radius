@@ -52,45 +52,6 @@ TPC_EST_CPU_MS = {
     ("tpch", "full_cached"): 2000,
 }
 
-# Exact file footprints of Plan(opt_expr) and Python().generator() in Stage 1 / 2a.
-_PLAN_FILES = frozenset({
-    "sqlglot/planner.py",
-    "sqlglot/optimizer/eliminate_joins.py",
-    "sqlglot/optimizer/normalize.py",
-    "sqlglot/optimizer/scope.py",
-    "sqlglot/expressions/builders.py",
-    "sqlglot/expressions/core.py",
-    "sqlglot/expressions/query.py",
-    "sqlglot/helper.py",
-})
-
-_PYGEN_FILES = frozenset({
-    "sqlglot/dialects/dialect.py",
-    "sqlglot/executor/python.py",
-    "sqlglot/expressions/core.py",
-    "sqlglot/generator.py",
-    "sqlglot/generators/python.py",
-    "sqlglot/helper.py",
-    "sqlglot/transforms.py",
-})
-
-_OPT_DIALECT_STEMS = frozenset({"dialect", "__init__", "base", "athena", "trino", "presto", "mysql", "hive"})
-
-
-def _can_skip_tpc_optimize(patched_files: dict[str, str] | None) -> bool:
-    """Return True if no patched file can execute during Stage-1 `optimize(expr, ensured_schema)`."""
-    if not patched_files:
-        return False
-    for p in patched_files:
-        if p in ("sqlglot/planner.py", "sqlglot/executor/python.py", "sqlglot/generators/python.py", "sqlglot/generators/duckdb.py"):
-            continue
-        if p.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")):
-            stem = p.rsplit("/", 1)[-1].removesuffix(".py")
-            if stem not in _OPT_DIALECT_STEMS:
-                continue
-        return False
-    return True
-
 _meta_cache: dict | None = None
 
 
@@ -160,7 +121,37 @@ def _rows_equal(cols_a, rows_a, cols_b, rows_b) -> bool:
     return True
 
 
-def verify_tpc_test(suite_name: str, mode: str, patched_files: dict[str, str] | None = None) -> bool:
+def _same_duckdb_results(suite_name: str, pairs: list[tuple[str, str]]) -> bool:
+    """True if each patched DuckDB SQL returns exactly what the pinned one does.
+
+    The real test's expected rows come from DuckDB running transpile(sql, write="duckdb"):
+    when the patched and pinned SQL return the same columns, types and rows on the test's
+    own views, the expected side of every comparison is unchanged.
+    """
+    import duckdb
+    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA
+
+    schema, folder = (TPCDS_SCHEMA, "tpc-ds") if suite_name == "tpcds" else (TPCH_SCHEMA, "tpc-h")
+    conn = duckdb.connect()
+    try:
+        # Same views as TestExecutor.setUpClass.
+        for table, columns in schema.items():
+            conn.execute(
+                f"CREATE VIEW {table} AS SELECT * FROM READ_CSV("
+                f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={columns})"
+            )
+        for new_sql, old_sql in pairs:
+            new = conn.execute(new_sql)
+            new_desc, new_rows = [d[:2] for d in new.description], new.fetchall()
+            old = conn.execute(old_sql)
+            if new_desc != [d[:2] for d in old.description] or new_rows != old.fetchall():
+                return False
+        return True
+    finally:
+        conn.close()
+
+
+def verify_tpc_test(suite_name: str, mode: str) -> bool:
     """Verify test_execute_tpcds or test_execute_tpch in the forked child; True iff proven PASS."""
     from sqlglot import Dialect, find_tables, parse_one
     from sqlglot.executor.python import Python, PythonExecutor
@@ -177,39 +168,50 @@ def verify_tpc_test(suite_name: str, mode: str, patched_files: dict[str, str] | 
         with open(TPC_STAGE1_FILE, "rb") as handle:
             s1 = pickle.load(handle)[suite_name]
         ensured_schema = ensure_schema(s1["schema"])
-        skip_opt = _can_skip_tpc_optimize(patched_files)
-        need_plan = not patched_files or bool(_PLAN_FILES & patched_files.keys())
-        need_pygen = not patched_files or bool(_PYGEN_FILES & patched_files.keys())
+        s2_cache: list = []
+
+        def same_rows_as_pinned(index: int, sql: str) -> bool:
+            """Run one query the way the real test does and compare its rows to the pinned run."""
+            from sqlglot.executor import execute
+
+            if not s2_cache:
+                with open(TPC_STAGE2_FILE, "rb") as handle:
+                    s2_cache.append(pickle.load(handle)[suite_name])
+            s2 = s2_cache[0]
+            q2 = s2["queries"][index]
+            tables = {
+                name: Table(columns=s2["schema"][name], rows=list(s2["tables_raw"][name]))
+                for name in q2["table_names"]
+            }
+            res = execute(parse_one(sql), schema=s2["schema"], tables=tables)
+            return _rows_equal(res.columns, res.rows, q2["columns"], q2["rows"])
 
         # Stage 1: parse all queries + find_tables + DuckDB transpile + ensure_schema + optimize + Plan.
-        for q in s1["queries"]:
+        # A query whose optimized AST or plan changed may still return the same rows, which is all
+        # the real test checks: execute just that query (with the patched executor) and compare.
+        duck_changed: list[tuple[str, str]] = []
+        for index, q in enumerate(s1["queries"]):
             expr = parse_one(q["sql"])
             if not q["execute"]:
                 continue
             if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
                 return False
-            if duck_gen.generate(expr) != q["duckdb_sql"]:
+            duck_sql = duck_gen.generate(expr)
+            if duck_sql != q["duckdb_sql"]:
+                duck_changed.append((duck_sql, q["duckdb_sql"]))
+            opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
+            if serde_dump(opt_expr) == q["opt_dump"] and plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]:
+                continue
+            if not same_rows_as_pinned(index, q["sql"]):
                 return False
-            if not skip_opt:
-                opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
-                if serde_dump(opt_expr) != q["opt_dump"]:
-                    return False
-                if need_plan:
-                    plan = Plan(opt_expr)
-                    if plan_signature(plan, serde_dump) != q["plan_sig"]:
-                        return False
-            elif need_plan:
-                plan = Plan(serde_load(q["opt_dump"]))
-                if plan_signature(plan, serde_dump) != q["plan_sig"]:
-                    return False
 
         # Stage 2a: Python().generator codegen parity on every expression generated during execution.
-        if need_pygen:
-            py_gen = Python().generator(identify=True, comments=False)
-            for expr_dump, expected_py in s1["gen_pairs"]:
-                if py_gen.generate(serde_load(expr_dump)) != expected_py:
-                    return False
-        return True
+        py_gen = Python().generator(identify=True, comments=False)
+        for expr_dump, expected_py in s1["gen_pairs"]:
+            if py_gen.generate(serde_load(expr_dump)) != expected_py:
+                return False
+        return not duck_changed or _same_duckdb_results(suite_name, duck_changed)
+
 
     with open(TPC_STAGE2_FILE, "rb") as handle:
         s2 = pickle.load(handle)[suite_name]
