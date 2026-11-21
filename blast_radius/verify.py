@@ -1149,12 +1149,13 @@ def _start_child_verification(
                 _mark(num, _run_candidate(num))
 
         # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
-        # each failure with adaptive throttling and a per-commit CPU cap.
+        # each failure with adaptive throttling and a deterministic estimated CPU cap.
         if not (sel.fixture_only and not VERIFY_FIXTURE_MAX_MS):
             per_mod_ms = 20 if task.phase == 1 else 4
             step2c_t0 = time.process_time()
+            step2c_est_ms = 0
             for _ in range(12):
-                if time.process_time() - step2c_t0 > 8.0:
+                if step2c_est_ms > 10000 or time.process_time() - step2c_t0 > 18.0:
                     break
                 if len(failed) >= 6 and len(failed) >= 2 * max(len(passed), 1):
                     break
@@ -1169,7 +1170,10 @@ def _start_child_verification(
                     per_mod_ms=per_mod_ms,
                     min_roi=cur_roi,
                 )
-                if not batch or all(_mark(num, _run_candidate(num)) for num in batch):
+                if not batch:
+                    break
+                step2c_est_ms += sum(cpu_by_number[n] for n in batch)
+                if all(_mark(num, _run_candidate(num)) for num in batch):
                     break
     except BaseException:
         pass

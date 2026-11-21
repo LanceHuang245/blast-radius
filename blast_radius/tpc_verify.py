@@ -65,9 +65,13 @@ TPC_EST_CPU_MS = {
 }
 
 # fast_a re-executes queries whose optimized plan changed; cheapest queries run first so broken
-# commits fail fast while legitimate plan refactors can still pass within budget.
+# commits fail fast. Primary budget uses deterministic precompiled s2b_query_ms (identical across
+# all 3 scorer runs); TPC_REEXEC_BUDGET_S is an emergency hard CPU ceiling.
 TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "25"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "6.0"))
+TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "7500"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "12.0"))
+TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "10"))
+TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "5.0"))
 
 _meta_cache: dict | None = None
 _ckpts_meta_cache: dict | None = None
@@ -611,22 +615,41 @@ def verify_tpc_test(
                 res = execute(parse_one(sql), schema=s2["schema"], tables=tables)
             return _rows_equal(res.columns, res.rows, q2["columns"], q2["rows"])
 
-        # Stage 1: fail-fast on changed plans via immediate lazy per-query same_rows_as_pinned.
-        duck_changed: list[tuple[str, str]] = []
+        # Stage 1: fail-fast on changed plans (same_rows_as_pinned) AND changed DuckDB SQL (lazy DuckDB conn).
+        duck_count = 0
+        duck_cpu = 0.0
+        duck_conn = None
         reexec_count = 0
         reexec_cpu = 0.0
 
-        def _check_changed_query(index: int, sql: str, opt_expr=None) -> bool:
-            nonlocal reexec_count, reexec_cpu
-            reexec_count += 1
-            if reexec_count > TPC_REEXEC_MAX_QUERIES or reexec_cpu > TPC_REEXEC_BUDGET_S:
-                _why(f"{suite_name}: reexec limit ({reexec_count} queries, {reexec_cpu:.2f}s)")
+        def _check_changed_duck(index: int, new_sql: str, old_sql: str) -> bool:
+            nonlocal duck_count, duck_cpu, duck_conn
+            duck_count += 1
+            if duck_count > TPC_DUCK_MAX_QUERIES or duck_cpu > TPC_DUCK_BUDGET_S:
+                _why(f"{suite_name}: duckdb limit ({duck_count} queries, {duck_cpu:.2f}s)")
                 return False
             t0 = time.process_time()
-            ok = same_rows_as_pinned(index, sql, opt_expr)
-            reexec_cpu += time.process_time() - t0
+            try:
+                if duck_conn is None:
+                    import duckdb
+                    from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA
+
+                    schema, folder = (TPCDS_SCHEMA, "tpc-ds") if suite_name == "tpcds" else (TPCH_SCHEMA, "tpc-h")
+                    duck_conn = duckdb.connect()
+                    for table, columns in schema.items():
+                        duck_conn.execute(
+                            f"CREATE VIEW {table} AS SELECT * FROM READ_CSV("
+                            f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={columns})"
+                        )
+                new = duck_conn.execute(new_sql)
+                new_desc, new_rows = [d[:2] for d in new.description], new.fetchall()
+                old = duck_conn.execute(old_sql)
+                ok = new_desc == [d[:2] for d in old.description] and new_rows == old.fetchall()
+            except BaseException:
+                ok = False
+            duck_cpu += time.process_time() - t0
             if not ok:
-                _why(f"{suite_name} q{index}: rows differ")
+                _why(f"{suite_name} q{index}: duckdb sql changed, results differ")
             return ok
 
         # Order queries by ascending Stage-2b runtime so broken commits fail fast on cheap queries.
@@ -636,114 +659,139 @@ def verify_tpc_test(
         if q_cost_ms and len(q_cost_ms) == len(q_order):
             q_order.sort(key=lambda i: (q_cost_ms[i], i))
 
-        if not (skip_opt and skip_duck and skip_plan):
-            for index in q_order:
-                q = s1["queries"][index]
-                if query_mask is not None and not (query_mask >> index & 1):
-                    continue
-                if skip_opt:
-                    if not q["execute"]:
-                        continue
-                    if not skip_duck:
-                        duck_sql = duck_gen.generate(parse_one(q["sql"]))
-                        if duck_sql != q["duckdb_sql"]:
-                            duck_changed.append((duck_sql, q["duckdb_sql"]))
-                    if not skip_plan:
-                        opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
-                        if plan_signature(Plan(opt_expr), serde_dump) != q["plan_sig"]:
-                            if not _check_changed_query(index, q["sql"], opt_expr):
-                                return False
-                    continue
+        reexec_est_ms = 0
 
-                if start_k is not None and (start_dumps_b is not None or start_dumps is not None):
-                    if not q["execute"]:
+        def _check_changed_query(index: int, sql: str, opt_expr=None) -> bool:
+            nonlocal reexec_count, reexec_cpu, reexec_est_ms
+            reexec_count += 1
+            q_est = q_cost_ms[index] if (q_cost_ms and index < len(q_cost_ms)) else 500
+            if (
+                reexec_count > TPC_REEXEC_MAX_QUERIES
+                or (reexec_est_ms > 0 and reexec_est_ms + q_est > TPC_REEXEC_EST_BUDGET_MS)
+                or reexec_cpu > TPC_REEXEC_BUDGET_S
+            ):
+                _why(f"{suite_name}: reexec limit ({reexec_count} queries, est={reexec_est_ms}ms, {reexec_cpu:.2f}s)")
+                return False
+            reexec_est_ms += q_est
+            t0 = time.process_time()
+            ok = same_rows_as_pinned(index, sql, opt_expr)
+            reexec_cpu += time.process_time() - t0
+            if not ok:
+                _why(f"{suite_name} q{index}: rows differ")
+            return ok
+
+        try:
+            if not (skip_opt and skip_duck and skip_plan):
+                for index in q_order:
+                    q = s1["queries"][index]
+                    if query_mask is not None and not (query_mask >> index & 1):
                         continue
-                    if not skip_duck:
-                        duck_sql = duck_gen.generate(parse_one(q["sql"]))
-                        if duck_sql != q["duckdb_sql"]:
-                            duck_changed.append((duck_sql, q["duckdb_sql"]))
-                    raw_ckpt = pickle.loads(start_dumps_b[index]) if start_dumps_b is not None else start_dumps[index]
-                    expr = serde_load(raw_ckpt)
-                    if start_k == 0 and scope_patched:
-                        if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
-                            _why(f"{suite_name} q{index}: tables changed")
-                            return False
-                    if stop_k is not None and (stop_dumps_b is not None or stop_dumps is not None):
-                        expr = optimize(
-                            expr,
-                            ensured_schema,
-                            rules=RULES[start_k:stop_k],
-                            leave_tables_isolated=True,
-                            copy=False,
-                        )
-                        stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
-                        if serde_dump(expr) == stop_raw:
+                    if skip_opt:
+                        if not q["execute"]:
                             continue
-                        opt_expr = optimize(
-                            expr,
-                            ensured_schema,
-                            rules=RULES[stop_k:],
-                            leave_tables_isolated=True,
-                            copy=False,
-                        )
-                    else:
-                        opt_expr = optimize(
-                            expr,
-                            ensured_schema,
-                            rules=RULES[start_k:],
-                            leave_tables_isolated=True,
-                            copy=False,
-                        )
-                    if serde_dump(opt_expr) != _q_opt_dump(q):
-                        if not _check_changed_query(index, q["sql"], opt_expr):
-                            return False
+                        if not skip_duck:
+                            duck_sql = duck_gen.generate(parse_one(q["sql"]))
+                            if duck_sql != q["duckdb_sql"]:
+                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"]):
+                                    return False
+                        if not skip_plan:
+                            opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
+                            if plan_signature(Plan(opt_expr), serde_dump) != q["plan_sig"]:
+                                if not _check_changed_query(index, q["sql"], opt_expr):
+                                    return False
                         continue
-                    if plan_untouched or plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]:
-                        continue
-                    opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
-                else:
-                    expr = parse_one(q["sql"])
-                    if not q["execute"]:
-                        continue
-                    if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
-                        _why(f"{suite_name} q{index}: tables changed")
-                        return False
-                    if not skip_duck:
-                        duck_sql = duck_gen.generate(expr)
-                        if duck_sql != q["duckdb_sql"]:
-                            duck_changed.append((duck_sql, q["duckdb_sql"]))
-                    if stop_k is not None and (stop_dumps_b is not None or stop_dumps is not None):
-                        if stop_k == 0:
+
+                    if start_k is not None and (start_dumps_b is not None or start_dumps is not None):
+                        if not q["execute"]:
+                            continue
+                        if not skip_duck:
+                            duck_sql = duck_gen.generate(parse_one(q["sql"]))
+                            if duck_sql != q["duckdb_sql"]:
+                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"]):
+                                    return False
+                        raw_ckpt = pickle.loads(start_dumps_b[index]) if start_dumps_b is not None else start_dumps[index]
+                        expr = serde_load(raw_ckpt)
+                        if start_k == 0 and scope_patched:
+                            if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
+                                _why(f"{suite_name} q{index}: tables changed")
+                                return False
+                        if stop_k is not None and (stop_dumps_b is not None or stop_dumps is not None):
+                            expr = optimize(
+                                expr,
+                                ensured_schema,
+                                rules=RULES[start_k:stop_k],
+                                leave_tables_isolated=True,
+                                copy=False,
+                            )
                             stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
                             if serde_dump(expr) == stop_raw:
                                 continue
-                            opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
-                        else:
-                            mid = optimize(expr, ensured_schema, rules=RULES[:stop_k], leave_tables_isolated=True)
-                            stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
-                            if serde_dump(mid) == stop_raw:
-                                continue
                             opt_expr = optimize(
-                                mid,
+                                expr,
                                 ensured_schema,
                                 rules=RULES[stop_k:],
                                 leave_tables_isolated=True,
                                 copy=False,
                             )
+                        else:
+                            opt_expr = optimize(
+                                expr,
+                                ensured_schema,
+                                rules=RULES[start_k:],
+                                leave_tables_isolated=True,
+                                copy=False,
+                            )
+                        if serde_dump(opt_expr) != _q_opt_dump(q):
+                            if not _check_changed_query(index, q["sql"], opt_expr):
+                                return False
+                            continue
+                        if plan_untouched or plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]:
+                            continue
+                        opt_expr = optimize(parse_one(q["sql"]), ensured_schema, leave_tables_isolated=True)
                     else:
-                        opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
-                if serde_dump(opt_expr) == _q_opt_dump(q) and (
-                    plan_untouched or plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]
-                ):
-                    continue
-                if not _check_changed_query(index, q["sql"], opt_expr):
-                    return False
+                        expr = parse_one(q["sql"])
+                        if not q["execute"]:
+                            continue
+                        if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
+                            _why(f"{suite_name} q{index}: tables changed")
+                            return False
+                        if not skip_duck:
+                            duck_sql = duck_gen.generate(expr)
+                            if duck_sql != q["duckdb_sql"]:
+                                if not _check_changed_duck(index, duck_sql, q["duckdb_sql"]):
+                                    return False
+                        if stop_k is not None and (stop_dumps_b is not None or stop_dumps is not None):
+                            if stop_k == 0:
+                                stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
+                                if serde_dump(expr) == stop_raw:
+                                    continue
+                                opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
+                            else:
+                                mid = optimize(expr, ensured_schema, rules=RULES[:stop_k], leave_tables_isolated=True)
+                                stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
+                                if serde_dump(mid) == stop_raw:
+                                    continue
+                                opt_expr = optimize(
+                                    mid,
+                                    ensured_schema,
+                                    rules=RULES[stop_k:],
+                                    leave_tables_isolated=True,
+                                    copy=False,
+                                )
+                        else:
+                            opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
+                    if serde_dump(opt_expr) == _q_opt_dump(q) and (
+                        plan_untouched or plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]
+                    ):
+                        continue
+                    if not _check_changed_query(index, q["sql"], opt_expr):
+                        return False
 
-        if duck_changed and not _same_duckdb_results(suite_name, duck_changed):
-            _why(f"{suite_name}: {len(duck_changed)} duckdb sql changed, results differ")
-            return False
-        _why(f"{suite_name}: pass ({reexec_count} reexec, {len(duck_changed)} duck changed)")
-        return True
+            _why(f"{suite_name}: pass ({reexec_count} reexec, {duck_count} duck changed)")
+            return True
+        finally:
+            if duck_conn is not None:
+                duck_conn.close()
 
     if mode == "fast_b":
         # Stage 2 only: rebuild Plan from cached optimized AST and run patched PythonExecutor,

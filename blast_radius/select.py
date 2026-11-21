@@ -521,7 +521,7 @@ class Selector:
         for removed, added in blocks:
             mask |= self.select_block(path, module, old_scopes, new_scopes, removed, added, ignore_ann)
 
-        if self.values is not None and path.startswith("sqlglot/"):
+        if self.values is not None and mask and path.startswith("sqlglot/"):
             # Every difference is a rearranged condition over the same operands: replay the
             # pinned run's recorded outcomes (import-time ones included) through the edit.
             try:
@@ -800,6 +800,24 @@ class Selector:
                 if old_no > last:
                     return None  # else:/finally: lines and the like
                 stop = last
+            # Per-statement value-map narrowing (also works in multi-hunk files).
+            if self.values is not None and path.startswith("sqlglot/"):
+                new_statement = new_scopes.statement_at(new_no)
+                if new_statement is not None and type(new_statement[2]) is type(stmt):
+                    new_stmt = new_statement[2]
+                    if not any(start <= ln <= stop for ln in self.impact.collect_lines.get(path, ())):
+                        vmask = None
+                        try:
+                            if isinstance(stmt, (ast.If, ast.While)):
+                                vmask = self.values.narrow_expr(path, stmt.test, new_stmt.test, stmt, "test", self.impact)
+                            elif not isinstance(stmt, COMPOUND_NODES):
+                                vmask = self.values.narrow_stmt(path, stmt, new_stmt, self.impact)
+                        except Exception:
+                            vmask = None
+                        if vmask is not None:
+                            self._spans.append((path, start, stop))
+                            mask |= vmask & self.impact.span(path, start, stop)
+                            continue
             span = self._test_time_span(path, start, stop)
             if span is None:
                 return None
@@ -943,7 +961,35 @@ class Selector:
                 return mask
             # Only the compound header changed while all sub-blocks are identical.
             if isinstance(so, COMPOUND_NODES) and _same_compound_bodies(so, sn, ignore_ann):
-                return self._test_time_span(path, so.lineno, header_end(so))
+                stop = header_end(so)
+                if (
+                    self.values is not None
+                    and path.startswith("sqlglot/")
+                    and isinstance(so, (ast.If, ast.While))
+                    and not any(so.lineno <= ln <= stop for ln in self.impact.collect_lines.get(path, ()))
+                ):
+                    try:
+                        vmask = self.values.narrow_expr(path, so.test, sn.test, so, "test", self.impact)
+                    except Exception:
+                        vmask = None
+                    if vmask is not None:
+                        self._spans.append((path, so.lineno, stop))
+                        return vmask & self.impact.span(path, so.lineno, stop)
+                return self._test_time_span(path, so.lineno, stop)
+            # Single non-compound statement edited in place: try per-statement value-map narrowing.
+            if (
+                not isinstance(so, COMPOUND_NODES)
+                and self.values is not None
+                and path.startswith("sqlglot/")
+                and not any(so.lineno <= ln <= so.end_lineno for ln in self.impact.collect_lines.get(path, ()))
+            ):
+                try:
+                    vmask = self.values.narrow_stmt(path, so, sn, self.impact)
+                except Exception:
+                    vmask = None
+                if vmask is not None:
+                    self._spans.append((path, so.lineno, so.end_lineno))
+                    return vmask & self.impact.span(path, so.lineno, so.end_lineno)
 
         mask = 0
         for s in mid_old:
