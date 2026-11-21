@@ -21,6 +21,7 @@ import math
 import pickle
 import time
 
+from blast_radius.precompile_cases import TPCDS_CKPTS_META_FILE, tpcds_ckpt_stage_file
 from blast_radius.precompile_tpc import (
     TPC_META_FILE,
     TPC_STAGE1_FILE,
@@ -58,6 +59,89 @@ TPC_REEXEC_MAX_QUERIES = 40
 TPC_REEXEC_BUDGET_S = 10.0
 
 _meta_cache: dict | None = None
+_ckpts_meta_cache: dict | None = None
+
+
+def load_tpcds_ckpts_meta() -> dict | None:
+    global _ckpts_meta_cache
+    if _ckpts_meta_cache is None and TPCDS_CKPTS_META_FILE.is_file():
+        with open(TPCDS_CKPTS_META_FILE, "rb") as handle:
+            _ckpts_meta_cache = pickle.load(handle)
+    return _ckpts_meta_cache
+
+
+def load_tpcds_ckpt_stage(stage: int) -> dict | None:
+    path = tpcds_ckpt_stage_file(stage)
+    if not path.is_file():
+        return None
+    with open(path, "rb") as handle:
+        return pickle.load(handle)
+
+
+def select_tpcds_ckpt(patched_files: dict[str, str], max_stage: int = 14) -> tuple[int, int] | None:
+    """Return highest sound (rule_stage, est_ms) checkpoint for TPC-DS whose prefix files are untouched."""
+    if not patched_files or not all(p.startswith("sqlglot/") for p in patched_files):
+        return None
+    meta = load_tpcds_ckpts_meta()
+    if meta is None:
+        return None
+    patched_set = set(patched_files)
+    for k in sorted(meta["checkpoints"], reverse=True):
+        if k > max_stage:
+            continue
+        if patched_set.isdisjoint(meta["checkpoints"][k]["files"]):
+            return k, meta["checkpoints"][k]["est_ms"]
+    return None
+
+
+def est_tpc_fast_a_ms(
+    suite_name: str,
+    patched_files: dict[str, str],
+    matched_queries: int | None,
+    total_queries: int,
+) -> int:
+    """Estimate fast_a CPU (ms) accounting for untouched sub-stages, checkpoints, and per-query filtering."""
+    base = TPC_EST_CPU_MS[(suite_name, "fast_a")]
+    if suite_name == "tpcds" and patched_files and all(p.startswith("sqlglot/") for p in patched_files):
+        meta = load_tpcds_ckpts_meta()
+        if meta is not None:
+            patched_set = set(patched_files)
+            if patched_set.isdisjoint(meta["s1_opt_files"]):
+                base = 350
+            else:
+                ckpt = select_tpcds_ckpt(patched_files, max_stage=5)
+                if ckpt is not None:
+                    base = min(base, ckpt[1])
+    if matched_queries is not None and total_queries > 0:
+        base = max(120, base * (matched_queries + 1) // (total_queries + 1))
+    return base
+
+
+def verify_opt_tpcds(patched_files: dict[str, str], case_indices: set[int] | None = None) -> bool:
+    """Verify TestOptimizer.test_tpcds from the highest untouched optimizer.RULES checkpoint."""
+    ckpt_info = select_tpcds_ckpt(patched_files, max_stage=14)
+    if ckpt_info is None:
+        return False
+    k, _ = ckpt_info
+    stage_data = load_tpcds_ckpt_stage(k)
+    if stage_data is None:
+        return False
+    from sqlglot.optimizer import optimize
+    from sqlglot.optimizer.optimizer import RULES
+    from sqlglot.schema import ensure_schema
+    from sqlglot.serde import load as serde_load
+
+    dumps = stage_data["dumps"]
+    expected = stage_data["expected"]
+    ensured = ensure_schema(stage_data["schema"]) if k < 14 else None
+    indices = sorted(case_indices) if case_indices is not None else range(len(expected))
+    for index in indices:
+        expr = serde_load(dumps[index])
+        if k < 14:
+            expr = optimize(expr, ensured, rules=RULES[k:], copy=False)
+        if expr.sql(pretty=True) != expected[index]:
+            return False
+    return True
 
 
 def load_tpc_meta() -> dict | None:
@@ -163,12 +247,18 @@ def _same_duckdb_results(suite_name: str, pairs: list[tuple[str, str]]) -> bool:
         conn.close()
 
 
-def verify_tpc_test(suite_name: str, mode: str) -> bool:
+def verify_tpc_test(
+    suite_name: str,
+    mode: str,
+    query_mask: int | None = None,
+    patched_files: dict[str, str] | None = None,
+) -> bool:
     """Verify test_execute_tpcds or test_execute_tpch in the forked child; True iff proven PASS."""
     from sqlglot import Dialect, find_tables, parse_one
     from sqlglot.executor.python import Python, PythonExecutor
     from sqlglot.executor.table import Table, ensure_tables
     from sqlglot.optimizer import optimize
+    from sqlglot.optimizer.optimizer import RULES
     from sqlglot.planner import Plan
     from sqlglot.schema import ensure_schema
     from sqlglot.serde import dump as serde_dump
@@ -181,6 +271,28 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
             s1 = pickle.load(handle)[suite_name]
         ensured_schema = ensure_schema(s1["schema"])
         s2_cache: list = []
+
+        skip_opt = False
+        skip_duck = False
+        skip_plan = False
+        skip_pygen = False
+        ckpt_k: int | None = None
+        ckpt_dumps: list | None = None
+        if suite_name == "tpcds" and patched_files and all(p.startswith("sqlglot/") for p in patched_files):
+            meta = load_tpcds_ckpts_meta()
+            if meta is not None:
+                patched_set = set(patched_files)
+                skip_opt = patched_set.isdisjoint(meta["s1_opt_files"])
+                skip_duck = patched_set.isdisjoint(meta["s1_duck_files"])
+                skip_plan = skip_opt and patched_set.isdisjoint(meta["s1_plan_files"])
+                skip_pygen = patched_set.isdisjoint(meta["s1_pygen_files"])
+                if not skip_opt:
+                    ckpt_info = select_tpcds_ckpt(patched_files, max_stage=5)
+                    if ckpt_info is not None:
+                        stage_data = load_tpcds_ckpt_stage(ckpt_info[0])
+                        if stage_data is not None:
+                            ckpt_k = ckpt_info[0]
+                            ckpt_dumps = stage_data["dumps"]
 
         def same_rows_as_pinned(index: int, sql: str) -> bool:
             """Run one query the way the real test does and compare its rows to the pinned run."""
@@ -198,30 +310,62 @@ def verify_tpc_test(suite_name: str, mode: str) -> bool:
             res = execute(parse_one(sql), schema=s2["schema"], tables=tables)
             return _rows_equal(res.columns, res.rows, q2["columns"], q2["rows"])
 
-        # Stage 1: parse all queries + find_tables + DuckDB transpile + ensure_schema + optimize + Plan.
-        # A query whose optimized AST or plan changed may still return the same rows, which is all
-        # the real test checks: execute just that query (with the patched executor) and compare.
+        # Stage 1: parse queries + find_tables + DuckDB transpile + ensure_schema + optimize + Plan.
+        # Only queries matching `query_mask` (when provided) and stages touching patched files run.
         duck_changed: list[tuple[str, str]] = []
         reexec: list[tuple[int, str]] = []
-        for index, q in enumerate(s1["queries"]):
-            expr = parse_one(q["sql"])
-            if not q["execute"]:
-                continue
-            if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
-                return False
-            duck_sql = duck_gen.generate(expr)
-            if duck_sql != q["duckdb_sql"]:
-                duck_changed.append((duck_sql, q["duckdb_sql"]))
-            opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
-            if serde_dump(opt_expr) == q["opt_dump"] and plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]:
-                continue
-            reexec.append((index, q["sql"]))
+        if not (skip_opt and skip_duck and skip_plan):
+            for index, q in enumerate(s1["queries"]):
+                if query_mask is not None and not (query_mask >> index & 1):
+                    continue
+                if skip_opt:
+                    if not q["execute"]:
+                        continue
+                    if not skip_duck:
+                        duck_sql = duck_gen.generate(parse_one(q["sql"]))
+                        if duck_sql != q["duckdb_sql"]:
+                            duck_changed.append((duck_sql, q["duckdb_sql"]))
+                    if not skip_plan:
+                        opt_expr = serde_load(q["opt_dump"])
+                        if plan_signature(Plan(opt_expr), serde_dump) != q["plan_sig"]:
+                            reexec.append((index, q["sql"]))
+                    continue
+
+                if ckpt_k is not None and ckpt_dumps is not None:
+                    if not q["execute"]:
+                        continue
+                    if not skip_duck:
+                        duck_sql = duck_gen.generate(parse_one(q["sql"]))
+                        if duck_sql != q["duckdb_sql"]:
+                            duck_changed.append((duck_sql, q["duckdb_sql"]))
+                    opt_expr = optimize(
+                        serde_load(ckpt_dumps[index]),
+                        ensured_schema,
+                        rules=RULES[ckpt_k:],
+                        leave_tables_isolated=True,
+                        copy=False,
+                    )
+                else:
+                    expr = parse_one(q["sql"])
+                    if not q["execute"]:
+                        continue
+                    if sorted({t.name for t in find_tables(expr)}) != q["table_names"]:
+                        return False
+                    if not skip_duck:
+                        duck_sql = duck_gen.generate(expr)
+                        if duck_sql != q["duckdb_sql"]:
+                            duck_changed.append((duck_sql, q["duckdb_sql"]))
+                    opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
+                if serde_dump(opt_expr) == q["opt_dump"] and plan_signature(Plan(opt_expr), serde_dump) == q["plan_sig"]:
+                    continue
+                reexec.append((index, q["sql"]))
 
         # Stage 2a: Python().generator codegen parity on every expression generated during execution.
-        py_gen = Python().generator(identify=True, comments=False)
-        for expr_dump, expected_py in s1["gen_pairs"]:
-            if py_gen.generate(serde_load(expr_dump)) != expected_py:
-                return False
+        if not skip_pygen:
+            py_gen = Python().generator(identify=True, comments=False)
+            for expr_dump, expected_py in s1["gen_pairs"]:
+                if py_gen.generate(serde_load(expr_dump)) != expected_py:
+                    return False
 
         # Re-executing changed queries costs CPU close to what dropping the test saves: give up
         # (keeping the test) when many changed or the budget runs out.

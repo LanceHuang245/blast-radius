@@ -211,8 +211,8 @@ def _typing_dialect_map(src: Path, trees: dict[str, ast.Module]) -> dict[str, li
     return out
 
 
-def _calibrate_and_update_tpc_meta(src: Path) -> dict[str, int]:
-    """Measure real single-process CPU of heavy tests and append opt_tpch_pairs to tpc_meta.pkl."""
+def _calibrate_and_update_tpc_meta(src: Path, all_test_ids: list[str]) -> dict[str, int]:
+    """Measure real single-process CPU of optimizer/dialect/heavy tests and append opt_tpch_pairs."""
     os.chdir(src)
     if str(src) not in sys.path:
         sys.path.insert(0, str(src))
@@ -220,13 +220,12 @@ def _calibrate_and_update_tpc_meta(src: Path) -> dict[str, int]:
     class _SyncExec:
         def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
             if initializer is not None:
-                initializer(*pickle.loads(pickle.dumps(initargs)))
+                initializer(*initargs)
 
         def submit(self, fn, /, *args, **kwargs):
             fut: cf.Future = cf.Future()
             try:
-                fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
-                fut.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+                fut.set_result(fn(*args, **kwargs))
             except BaseException as err:
                 fut.set_exception(err)
             return fut
@@ -266,9 +265,26 @@ def _calibrate_and_update_tpc_meta(src: Path) -> dict[str, int]:
             with open(TPC_META_FILE, "wb") as handle:
                 pickle.dump(tpc_meta, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
+    skip_ids = frozenset({
+        "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+        "tests/test_parser.py::TestParser::test_max_nodes",
+        "tests/test_generator.py::TestGenerator::test_generator_memory",
+        "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+        "tests/test_executor.py::TestExecutor::test_execute_tpch",
+        "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+    })
+    to_calibrate: list[str] = list(CALIBRATED_TESTS)
+    seen_cal = set(to_calibrate)
+    for tid in all_test_ids:
+        if tid in seen_cal or tid in skip_ids:
+            continue
+        if tid.startswith(("tests/test_optimizer.py::", "tests/dialects/test_")) and tid.count("::") == 2:
+            to_calibrate.append(tid)
+            seen_cal.add(tid)
+
     real_cpu_ms: dict[str, int] = {}
     loaded: dict[tuple[str, str], type] = {}
-    for tid in CALIBRATED_TESTS:
+    for tid in to_calibrate:
         file_path, cls_name, meth_name = tid.split("::")
         mod_name = file_path[:-3].replace("/", ".")
         key = (mod_name, cls_name)
@@ -307,8 +323,9 @@ def main() -> None:
     raw["import_any_attrs"] = [a for a in raw.get("import_any_attrs", []) if a != "EXPRESSION_METADATA"]
     raw["import_value_attrs"] = [a for a in raw.get("import_value_attrs", []) if a != "EXPRESSION_METADATA"]
     raw["typing_dialects"] = typing_dialects
-    cal = _calibrate_and_update_tpc_meta(SOURCE)
+    cal = _calibrate_and_update_tpc_meta(SOURCE, raw["tests"])
     cal["tests/test_generator.py::TestGenerator::test_generator_memory"] = 18400
+    cal["tests/dialects/test_dialect.py::TestDialect::test_lazy_load"] = 5
     raw["real_cpu_ms"] = cal
 
     seen: dict[int, int] = {m: i for i, m in enumerate(old_masks)}

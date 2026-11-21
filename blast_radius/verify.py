@@ -43,10 +43,13 @@ from blast_radius.select import Selection
 from blast_radius.tpc_verify import (
     TPC_EST_CPU_MS,
     TPC_SUITE_BY_TEST_ID,
+    est_tpc_fast_a_ms,
     select_tpc_mode,
+    select_tpcds_ckpt,
     verify_generator_memory,
     verify_lazy_athena_presto,
     verify_max_nodes,
+    verify_opt_tpcds,
     verify_optimized_tpch,
     verify_tpc_test,
 )
@@ -71,8 +74,10 @@ CHILD_LIMIT_FACTOR = 3.0
 VERIFY_WALL_BUDGET_S = float(os.environ.get("BR_VERIFY_WALL_S", "130"))
 
 OPT_TPCH_TEST_ID = "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+OPT_TPCDS_TEST_ID = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
 MAX_NODES_TEST_ID = "tests/test_parser.py::TestParser::test_max_nodes"
 GEN_MEM_TEST_ID = "tests/test_generator.py::TestGenerator::test_generator_memory"
+LAZY_LOAD_TEST_ID = "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"
 
 # Tests in TestExecutor that actually use numpy/pandas/TPC fixtures when run via real unittest.
 TPC_EXECUTOR_TESTS = frozenset({
@@ -81,18 +86,18 @@ TPC_EXECUTOR_TESTS = frozenset({
     "tests/test_executor.py::TestExecutor::test_execute_tpcds",
 })
 
-# Tests that inspect fresh import state or spawn subprocesses must never run in Phase 2.
+# Tests that inspect fresh import state must never run in Phase 2.
 FRESH_IMPORT_TESTS = frozenset({
-    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
+    LAZY_LOAD_TEST_ID,
     "tests/test_dialect_imports.py::TestDialectImports::test_dialect_attribute_access_is_cached",
     "tests/test_dialect_imports.py::TestDialectImports::test_dialect_import_no_deadlock",
 })
 
-# Tests that spawn a fresh Python interpreter against disk cannot see an in-memory overlay;
-# we keep this individual test unverified while still verifying/decapitating its sibling tests.
-SUBPROCESS_TESTS = frozenset({
-    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",
-})
+# test_lazy_load is verified in <1ms at the start of Phase 1 before any dialects load.
+SUBPROCESS_TESTS: frozenset[str] = frozenset()
+
+# Skip redundant pickle round-trips in _LazyFuture when serde/expressions.core are untouched.
+_SKIP_POOL_PICKLE = False
 
 LAZY_EXECUTOR_ATTRS = (
     "tpch_conn",
@@ -117,9 +122,11 @@ class VerifyTask:
     tpc_mode: str | None = None
     lazy_pp_nums: set[int] = field(default_factory=set)
     decap_targets: list[int] = field(default_factory=list)
-    # Fixture-mapped tests: the (fixture file, index) cases the edit reaches, and the CPU
-    # estimates scaled down to running just those.
+    # Fine-grained case/subTest/Validator/TPC filters and their scaled CPU estimates.
     case_filter: dict[int, set[tuple[str, int]]] = field(default_factory=dict)
+    subtest_filter: dict[int, tuple[int, int]] = field(default_factory=dict)
+    validator_filter: dict[int, tuple[int, int]] = field(default_factory=dict)
+    tpc_query_mask: dict[int, int] = field(default_factory=dict)
     cpu_override: dict[int, int] = field(default_factory=dict)
 
 
@@ -138,8 +145,11 @@ class _LazyFuture(cf.Future):
         fn, args, kwargs = self._work
         self._work = None
         try:
-            fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
-            self.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
+            if _SKIP_POOL_PICKLE:
+                self.set_result(fn(*args, **kwargs))
+            else:
+                fn, args, kwargs = pickle.loads(pickle.dumps((fn, args, kwargs)))
+                self.set_result(pickle.loads(pickle.dumps(fn(*args, **kwargs))))
         except BaseException as error:
             self.set_exception(error)
 
@@ -151,15 +161,14 @@ class _LazyFuture(cf.Future):
 class _InProcessExecutor:
     """Replaces ProcessPoolExecutor in child so workers see in-memory patches with zero spawn cost.
 
-    Arguments and results still go through pickle, as they would to a spawned worker:
-    sqlglot expressions pickle through serde (Expression.__reduce__), so a patch that
-    breaks serialization must fail here too. Lazy evaluation on .result() lets
+    When serde/expressions.core are patched, arguments and results still round-trip through
+    pickle so broken Expression.__reduce__ fails here too. Lazy evaluation on .result() lets
     TestOptimizer.check_file abort on the first failing query instead of running all 500.
     """
 
     def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **_):
         if initializer is not None:
-            initializer(*pickle.loads(pickle.dumps(initargs)))
+            initializer(*(initargs if _SKIP_POOL_PICKLE else pickle.loads(pickle.dumps(initargs))))
         self._futures: list[_LazyFuture] = []
 
     def submit(self, fn, /, *args, **kwargs):
@@ -487,7 +496,26 @@ def _install_fail_fast_subtest() -> None:
     unittest.TestCase.subTest = _ff_subtest
 
 
-_CASE_STATE: dict = {"allowed": None, "in_check": False}
+_CASE_STATE: dict = {
+    "allowed": None,
+    "in_check": False,
+    "subtest_mask": None,
+    "subtest_stride": 1,
+    "subtest_idx": 0,
+    "val_mask": None,
+    "val_stride": 1,
+    "val_idx": 0,
+    "val_depth": 0,
+}
+
+
+def _br_subtest_ok() -> bool:
+    mask = _CASE_STATE["subtest_mask"]
+    if mask is None:
+        return True
+    idx = _CASE_STATE["subtest_idx"]
+    _CASE_STATE["subtest_idx"] = idx + 1
+    return bool(mask >> (idx // _CASE_STATE["subtest_stride"]) & 1)
 
 
 def _install_case_filter(mod) -> None:
@@ -515,6 +543,45 @@ def _install_case_filter(mod) -> None:
             _CASE_STATE["in_check"] = False
 
     mod.TestOptimizer.check_file = check_file
+
+
+def _install_subtest_filter(mod, cls: type, meth_name: str) -> None:
+    """Lazily wrap `cls.<meth_name>` so its top-level `with self.subTest(...):` blocks can filter by bitmask."""
+    fn = cls.__dict__.get(meth_name)
+    if fn is not None and not getattr(fn, "_br_subtest_wrapped", False):
+        from blast_radius.precompile_cases import transform_subtest_method
+
+        transform_subtest_method(mod, cls, meth_name, _br_subtest_ok)
+
+
+def _install_validator_filter() -> None:
+    """Wrap Validator.validate_identity/validate_all/validate_transpile once to skip unreached calls."""
+    from tests.dialects.test_dialect import Validator
+
+    if getattr(Validator, "_br_val_filter", False):
+        return
+    Validator._br_val_filter = True
+    for attr in ("validate_identity", "validate_all", "validate_transpile"):
+        orig = getattr(Validator, attr)
+
+        def make_wrapped(fn):
+            def wrapped(self, *args, **kwargs):
+                mask = _CASE_STATE["val_mask"]
+                if mask is None or _CASE_STATE["val_depth"] > 0:
+                    return fn(self, *args, **kwargs)
+                idx = _CASE_STATE["val_idx"]
+                _CASE_STATE["val_idx"] = idx + 1
+                if not (mask >> (idx // _CASE_STATE["val_stride"]) & 1):
+                    return None
+                _CASE_STATE["val_depth"] += 1
+                try:
+                    return fn(self, *args, **kwargs)
+                finally:
+                    _CASE_STATE["val_depth"] -= 1
+
+            return wrapped
+
+        setattr(Validator, attr, make_wrapped(orig))
 
 
 def _can_fast_opt_tpch(sel: Selection) -> bool:
@@ -552,10 +619,23 @@ def _est_test_cpu_ms(
     sel: Selection,
     tpc_mode: str | None,
     cpu_by_number: dict[int, int],
+    tpc_query_mask: dict[int, int] | None = None,
 ) -> int:
     """Return best realistic CPU estimate (ms) for verifying test `num` on `sel`."""
+    if tid == LAZY_LOAD_TEST_ID and "tests/dialects/test_dialect.py" not in sel.patched_files:
+        return 5
     if tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
-        return TPC_EST_CPU_MS[(TPC_SUITE_BY_TEST_ID[tid], tpc_mode)]
+        suite = TPC_SUITE_BY_TEST_ID[tid]
+        if tpc_mode == "fast_a":
+            q_mask = tpc_query_mask.get(num) if tpc_query_mask is not None else None
+            total_q = 99 if suite == "tpcds" else 22
+            return est_tpc_fast_a_ms(
+                suite,
+                sel.patched_files,
+                q_mask.bit_count() if q_mask is not None else None,
+                total_q,
+            )
+        return TPC_EST_CPU_MS[(suite, tpc_mode)]
     if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
         return 100
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
@@ -585,7 +665,26 @@ def _best_drop_prefix(
 ) -> list[int]:
     """Candidates worth verifying to drop from `pool`: the prefix, cheapest CPU per saved ms
     first, with the best net (cost saved minus CPU spent), if that net reaches `min_gain`."""
-    order = sorted(candidates, key=lambda n: (cpu_by_number[n] / max(ms_by_number[n], 1), -ms_by_number[n], n))
+    cand_set = set(candidates)
+    if not cand_set:
+        return []
+    # When pool cannot be emptied to 0 workers, 0ms tests can never reduce simulated cost.
+    can_empty = pool <= cand_set
+    if not can_empty:
+        cand_list = [n for n in cand_set if ms_by_number[n] > 0]
+    else:
+        cand_list = list(cand_set)
+    if not cand_list:
+        return []
+    order = sorted(
+        cand_list,
+        key=lambda n: (
+            1 if ms_by_number[n] == 0 else 0,
+            cpu_by_number[n] / max(ms_by_number[n], 1),
+            -ms_by_number[n],
+            n,
+        ),
+    )
     desc = sorted(pool, key=lambda n: -ms_by_number[n])
     total = sum(ms_by_number[n] for n in pool)
     count = len(pool)
@@ -615,19 +714,20 @@ def _has_decap_prefix_roi(
     id_by_number: dict[int, str],
     ms_by_number: dict[int, int],
     cpu_by_number: dict[int, int],
+    tpc_query_mask: dict[int, int] | None = None,
 ) -> bool:
     """Check if the tallest remaining decap target `elig_rem[0]` belongs to a net-profitable prefix."""
     if not elig_rem:
         return False
     num = elig_rem[0]
-    t_cpu = _est_test_cpu_ms(num, id_by_number[num], sel, tpc_mode, cpu_by_number)
+    t_cpu = _est_test_cpu_ms(num, id_by_number[num], sel, tpc_mode, cpu_by_number, tpc_query_mask)
     cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
     min_req = MIN_DECAP_GAIN_MS if failed else MIN_GAIN_MS
     trial = set(cur_pool)
     acc_cpu = 0
     for cand in elig_rem:
         trial.discard(cand)
-        acc_cpu += _est_test_cpu_ms(cand, id_by_number[cand], sel, tpc_mode, cpu_by_number)
+        acc_cpu += _est_test_cpu_ms(cand, id_by_number[cand], sel, tpc_mode, cpu_by_number, tpc_query_mask)
         after_c, _ = split_with_cost([(ms_by_number[n], n) for n in trial])
         if (cur_c - after_c) - acc_cpu >= min_req:
             with_num_c, _ = split_with_cost([(ms_by_number[n], n) for n in (trial | {num})])
@@ -657,20 +757,35 @@ def _start_child_verification(
         except OSError:
             pass
     try:
+        global _SKIP_POOL_PICKLE
         gc.enable()
         cpu_by_number = {**cpu_by_number, **task.cpu_override}
+        _SKIP_POOL_PICKLE = not any(
+            p in ("sqlglot/serde.py", "sqlglot/expressions/core.py") for p in task.selection.patched_files
+        )
         os.chdir(SOURCE)
         if str(SOURCE) not in sys.path:
             sys.path.insert(0, str(SOURCE))
         _patch_pool_references()
         _install_fail_fast_subtest()
 
+        lazy_load_ok: bool | None = None
         if task.phase == 1:
             if "sqlglot" in sys.modules:
                 for k in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests."))]:
                     sys.modules.pop(k, None)
             sys.meta_path.insert(0, _OverlayFinder(task.selection.patched_files))
             _install_open_overlay(task.selection.patched_files)
+            if (
+                "tests/dialects/test_dialect.py" not in task.selection.patched_files
+                and any(id_by_number[n] == LAZY_LOAD_TEST_ID for n in task.chosen)
+            ):
+                try:
+                    import sqlglot as _sg
+
+                    lazy_load_ok = len(_sg.Dialect._classes) == 1
+                except BaseException:
+                    lazy_load_ok = False
         else:
             _install_open_overlay(task.selection.patched_files)
             if task.selection.hot_patch_targets:
@@ -692,6 +807,7 @@ def _start_child_verification(
         failed: set[int] = set()
         passed: set[int] = set()
         loaded_classes: dict[tuple[str, str], type] = {}
+        loaded_mods: dict[str, types.ModuleType] = {}
         setup_done: set[type] = set()
         sel = task.selection
         executor_patched = "tests/test_executor.py" in sel.patched_files
@@ -723,6 +839,7 @@ def _start_child_verification(
             try:
                 if key not in loaded_classes:
                     mod = importlib.import_module(mod_name)
+                    loaded_mods[mod_name] = mod
                     if mod_name in ("tests.test_optimizer", "tests.test_executor"):
                         _patch_pool_references()
                     if mod_name == "tests.test_optimizer":
@@ -735,23 +852,60 @@ def _start_child_verification(
                         cls.setUpClass()
                         setup_done.add(cls)
                 cls = loaded_classes[key]
+                sub_spec = task.subtest_filter.get(num)
+                val_spec = task.validator_filter.get(num)
+                if sub_spec is not None:
+                    _install_subtest_filter(loaded_mods[mod_name], cls, meth_name)
+                if val_spec is not None:
+                    _install_validator_filter()
                 res = unittest.TestResult()
                 _CASE_STATE["allowed"] = task.case_filter.get(num)
+                if sub_spec is not None:
+                    _CASE_STATE["subtest_mask"], _CASE_STATE["subtest_stride"] = sub_spec
+                else:
+                    _CASE_STATE["subtest_mask"], _CASE_STATE["subtest_stride"] = None, 1
+                _CASE_STATE["subtest_idx"] = 0
+                if val_spec is not None:
+                    _CASE_STATE["val_mask"], _CASE_STATE["val_stride"] = val_spec
+                else:
+                    _CASE_STATE["val_mask"], _CASE_STATE["val_stride"] = None, 1
+                _CASE_STATE["val_idx"] = 0
+                _CASE_STATE["val_depth"] = 0
                 cls(meth_name).run(res)
                 ok = res.wasSuccessful()
             except BaseException:
                 ok = False
             finally:
                 _CASE_STATE["allowed"] = None
+                _CASE_STATE["subtest_mask"] = None
+                _CASE_STATE["val_mask"] = None
+                _CASE_STATE["val_depth"] = 0
                 signal.alarm(0)
             return ok
 
         def _run_candidate(num: int) -> bool:
             tid = id_by_number[num]
+            if tid == LAZY_LOAD_TEST_ID and lazy_load_ok is not None:
+                return lazy_load_ok
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
                 signal.alarm(65)
                 try:
-                    return verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode)
+                    return verify_tpc_test(
+                        TPC_SUITE_BY_TEST_ID[tid],
+                        task.tpc_mode,
+                        query_mask=task.tpc_query_mask.get(num),
+                        patched_files=sel.patched_files,
+                    )
+                except BaseException:
+                    return False
+                finally:
+                    signal.alarm(0)
+            if tid == OPT_TPCDS_TEST_ID and select_tpcds_ckpt(sel.patched_files, max_stage=14) is not None:
+                signal.alarm(25)
+                try:
+                    cf_set = task.case_filter.get(num)
+                    indices = {idx for _, idx in cf_set} if cf_set is not None else None
+                    return verify_opt_tpcds(sel.patched_files, indices)
                 except BaseException:
                     return False
                 finally:
@@ -811,7 +965,7 @@ def _start_child_verification(
 
         if decap_set:
             total_decap_cpu = sum(
-                _est_test_cpu_ms(n, id_by_number[n], sel, task.tpc_mode, cpu_by_number)
+                _est_test_cpu_ms(n, id_by_number[n], sel, task.tpc_mode, cpu_by_number, task.tpc_query_mask)
                 for n in decap_set
             )
             other_rem = verifiable - decap_set
@@ -824,19 +978,9 @@ def _start_child_verification(
             # Only run a pre-decap fail-fast probe when decap targets are expensive (>= 1.5s)
             # or when the remaining tail is small enough to verify completely.
             need_probe = total_decap_cpu >= 1500 or will_verify_tail
-            patched_stems = {
-                p.rsplit("/", 1)[-1].removesuffix(".py")
-                for p in sel.patched_files
-                if p.endswith(".py")
-            } - {"__init__", "dialect", "base", "core", "helper"}
             other_ordered = sorted(
                 other_rem,
-                key=lambda n: (
-                    0 if (not will_verify_tail and cpu_by_number[n] <= 120 and any(s in id_by_number[n] for s in patched_stems)) else 1,
-                    cpu_by_number[n],
-                    ms_by_number[n],
-                    id_by_number[n],
-                ),
+                key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
             )
             probe_tests: list[int] = []
             probe_cpu = 0
@@ -851,17 +995,23 @@ def _start_child_verification(
                 if not _mark(num, _run_candidate(num)):
                     break
 
-            # Step 2b: Makespan & worker-collapsing decapitation, in the order the planner chose
-            # (tallest-first or cheapest-per-saved-ms first, whichever saved more).
+            # Step 2b: Makespan & worker-collapsing decapitation. Never block test_execute_tpch
+            # (fast & high ROI even in full_cached) or fast_a TPC after a unit-test failure.
+            def _tpc_blocked_after_fail(n: int) -> bool:
+                if not failed:
+                    return False
+                tid_n = id_by_number[n]
+                if tid_n not in TPC_SUITE_BY_TEST_ID:
+                    return False
+                if TPC_SUITE_BY_TEST_ID[tid_n] == "tpch" or task.tpc_mode == "fast_a":
+                    return False
+                return True
+
             decap_ordered = [n for n in task.decap_targets if n in decap_set]
             for idx, num in enumerate(decap_ordered):
-                if failed and id_by_number[num] in TPC_SUITE_BY_TEST_ID and task.tpc_mode != "fast_a":
+                if _tpc_blocked_after_fail(num):
                     continue
-                elig_rem = [
-                    x
-                    for x in decap_ordered[idx:]
-                    if not (failed and id_by_number[x] in TPC_SUITE_BY_TEST_ID and task.tpc_mode != "fast_a")
-                ]
+                elig_rem = [x for x in decap_ordered[idx:] if not _tpc_blocked_after_fail(x)]
                 cur_pool = task.chosen - passed
                 if not _has_decap_prefix_roi(
                     cur_pool,
@@ -872,6 +1022,7 @@ def _start_child_verification(
                     id_by_number,
                     ms_by_number,
                     cpu_by_number,
+                    task.tpc_query_mask,
                 ):
                     continue
                 _mark(num, _run_candidate(num))
@@ -910,31 +1061,87 @@ def _case_plan(
     sel: Selection,
     id_by_number: dict[int, str],
     base_cpu: dict[int, int],
-) -> tuple[dict[int, set[tuple[str, int]]], dict[int, int]]:
-    """For fixture-mapped tests, the cases reaching the edited spans and scaled CPU estimates."""
+) -> tuple[
+    dict[int, set[tuple[str, int]]],
+    dict[int, tuple[int, int]],
+    dict[int, tuple[int, int]],
+    dict[int, int],
+    dict[int, int],
+]:
+    """Compute per-case/subTest/Validator/TPC query filters and scaled CPU estimates for `chosen`."""
     global _CASE_MAP
-    if sel.edited_spans is None:
-        return {}, {}
-    if _CASE_MAP is None:
-        from blast_radius.precompile_cases import CASES_FILE
-
-        _CASE_MAP = marshal.loads(CASES_FILE.read_bytes()) if CASES_FILE.is_file() else {}
     case_filter: dict[int, set[tuple[str, int]]] = {}
+    subtest_filter: dict[int, tuple[int, int]] = {}
+    validator_filter: dict[int, tuple[int, int]] = {}
+    tpc_query_mask: dict[int, int] = {}
     cpu_override: dict[int, int] = {}
-    for num in chosen:
-        entry = _CASE_MAP.get(id_by_number[num])
-        if entry is None:
-            continue
-        mask = 0
-        for path, first, last in sel.edited_spans:
-            per_line = entry["lines"].get(path)
-            if per_line:
-                for line in range(first, last + 1):
-                    mask |= per_line.get(line, 0)
-        cases = entry["cases"]
-        case_filter[num] = {tuple(cases[k]) for k in range(len(cases)) if mask >> k & 1}
-        cpu_override[num] = max(20, base_cpu[num] * (len(case_filter[num]) + 1) // (len(cases) + 1))
-    return case_filter, cpu_override
+
+    if sel.edited_spans is not None:
+        if _CASE_MAP is None:
+            from blast_radius.precompile_cases import CASES_FILE
+
+            _CASE_MAP = marshal.loads(CASES_FILE.read_bytes()) if CASES_FILE.is_file() else {}
+        for num in chosen:
+            tid = id_by_number[num]
+            entry = _CASE_MAP.get(tid)
+            if entry is None:
+                continue
+            mask = 0
+            for path, first, last in sel.edited_spans:
+                per_line = entry["lines"].get(path)
+                if per_line:
+                    for line in range(first, last + 1):
+                        mask |= per_line.get(line, 0)
+            kind = entry.get("kind", "check_file")
+            if kind == "tpc_stage1":
+                if mask:
+                    tpc_query_mask[num] = mask
+                else:
+                    # Only skip Stage 1 (mask=0) if Stage 2a actually executed an edited span.
+                    s2a = entry.get("s2a_lines", {})
+                    if any(
+                        first <= ln <= last
+                        for path, first, last in sel.edited_spans
+                        for ln in s2a.get(path, ())
+                    ):
+                        tpc_query_mask[num] = 0
+                continue
+            # Soundness guard: if a selected test matched 0 recorded cases, run it unfiltered.
+            if not mask:
+                continue
+            if kind == "check_file":
+                cases = entry["cases"]
+                matched = {tuple(cases[k]) for k in range(len(cases)) if mask >> k & 1}
+                if len(matched) < len(cases):
+                    case_filter[num] = matched
+                    cpu_override[num] = max(20, base_cpu[num] * (len(matched) + 1) // (len(cases) + 1))
+            elif kind == "subtest":
+                count = entry["count"]
+                hits = mask.bit_count()
+                if hits < count:
+                    subtest_filter[num] = (mask, entry.get("stride", 1))
+                    cpu_override[num] = max(20, base_cpu[num] * (hits + 1) // (count + 1))
+            elif kind == "validator":
+                count = entry["count"]
+                full_mask = mask | entry.get("always", 0)
+                hits = full_mask.bit_count()
+                if hits < count:
+                    validator_filter[num] = (full_mask, entry.get("stride", 1))
+                    cpu_override[num] = max(10, base_cpu[num] * (hits + 1) // (count + 1))
+
+    # Apply TPC-DS optimizer rule-stage checkpoint CPU estimate to TestOptimizer.test_tpcds.
+    ckpt_info = select_tpcds_ckpt(sel.patched_files, max_stage=14)
+    if ckpt_info is not None:
+        _, ckpt_est_ms = ckpt_info
+        for num in chosen:
+            if id_by_number[num] == OPT_TPCDS_TEST_ID:
+                if num in case_filter:
+                    scaled = max(35, ckpt_est_ms * (len(case_filter[num]) + 1) // 100)
+                else:
+                    scaled = ckpt_est_ms
+                cpu_override[num] = min(cpu_override.get(num, base_cpu[num]), scaled)
+
+    return case_filter, subtest_filter, validator_filter, tpc_query_mask, cpu_override
 
 
 def plan_verification(
@@ -949,7 +1156,9 @@ def plan_verification(
     for commit, chosen, sel in commits:
         if not chosen or not sel.patched_files or sel.reason.startswith("everything"):
             continue
-        case_filter, cpu_override = _case_plan(chosen, sel, id_by_number, base_cpu)
+        case_filter, subtest_filter, validator_filter, tpc_query_mask, cpu_override = _case_plan(
+            chosen, sel, id_by_number, base_cpu
+        )
         cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else base_cpu
         tids = [id_by_number[n] for n in chosen]
         verifiable = {n for n in chosen if id_by_number[n] not in SUBPROCESS_TESTS}
@@ -994,10 +1203,10 @@ def plan_verification(
             if tid in TPC_SUITE_BY_TEST_ID:
                 if tpc_mode is None:
                     continue
-                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number)
+                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask)
                 raw_decap.append((sim_ms, c_ms, num))
-            elif tid in (OPT_TPCH_TEST_ID, MAX_NODES_TEST_ID, GEN_MEM_TEST_ID):
-                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number)
+            elif tid in (OPT_TPCH_TEST_ID, MAX_NODES_TEST_ID, GEN_MEM_TEST_ID, LAZY_LOAD_TEST_ID):
+                c_ms = _est_test_cpu_ms(num, tid, sel, tpc_mode, cpu_by_number, tpc_query_mask)
                 if c_ms < sim_ms:
                     raw_decap.append((sim_ms, c_ms, num))
             elif sim_ms >= 150:
@@ -1012,7 +1221,7 @@ def plan_verification(
         raw_decap = sorted(raw_decap, key=lambda item: (item[1] - item[0], item[2]))[:30]
         cur_pool = chosen - lazy_pp_nums
         cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
-        base_net =(static_cost_ms - cur_cost) - (15 if lazy_pp_nums else 0)
+        base_net = (static_cost_ms - cur_cost) - (15 if lazy_pp_nums else 0)
         best_net = base_net
         best_prefix: list[int] = []
         orders = (
@@ -1035,7 +1244,6 @@ def plan_verification(
             if order_best > best_net:
                 best_net, best_prefix = order_best, order_prefix
 
-        # Keep selected decap targets ordered tallest-first so dominant ceilings are knocked down first.
         decap_targets = list(best_prefix)
         decap_set = set(decap_targets)
         # Tail: the other verifiable tests worth dropping, as the best ROI prefix (the child
@@ -1047,7 +1255,8 @@ def plan_verification(
             return prefix, sum(cpu_by_number[n] for n in prefix)
 
         decap_cpu = sum(
-            _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number) for n in decap_targets
+            _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number, tpc_query_mask)
+            for n in decap_targets
         ) + (15 if lazy_pp_nums else 0)
         pool_after_decap = chosen - lazy_pp_nums - decap_set
         tail_prefix, tail_cpu = plan_tail(pool_after_decap, rem_verifiable - decap_set)
@@ -1082,6 +1291,9 @@ def plan_verification(
                 lazy_pp_nums=lazy_pp_nums,
                 decap_targets=decap_targets,
                 case_filter=case_filter,
+                subtest_filter=subtest_filter,
+                validator_filter=validator_filter,
+                tpc_query_mask=tpc_query_mask,
                 cpu_override=cpu_override,
             )
         )

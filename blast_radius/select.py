@@ -440,9 +440,13 @@ class Selector:
             new_tree = ast.parse(new_text)
             compile(new_tree, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
-            # The module cannot import: exactly what an import-time change reaches fails.
+            # The module cannot import: exactly what an import-time change reaches fails
+            # (plus test_docs.py for sqlglot/ modules walked dynamically by pkgutil).
             self._spans_ok = False
-            return self.impact.module_level(path), False, new_text, None, None
+            mask = self.impact.module_level(path)
+            if path.startswith("sqlglot/"):
+                mask |= self.docs_mask
+            return mask, False, new_text, None, None
         new_scopes = Scopes(new_tree, has_lambda="lambda" in new_text)
 
         # Normalized AST equivalence catches quote/paren/wrapping refactors, TYPE_CHECKING-only
@@ -580,17 +584,27 @@ class Selector:
             return None
         old_entries, old_spreads = old_parsed
         new_entries, new_spreads = new_parsed
-        if old_spreads != new_spreads or list(old_entries) != list(new_entries):
+        if old_spreads != new_spreads:
+            return None
+        # _TrackedDict records key hits, not misses: key removals, reorderings, and value
+        # edits are exact; newly added keys fall back conservatively.
+        if not (set(new_entries) <= set(old_entries)):
             return None
         changed_keys = [
-            toks for toks in old_entries if ast.dump(old_entries[toks]) != ast.dump(new_entries[toks])
+            toks
+            for toks in old_entries
+            if toks not in new_entries or ast.dump(old_entries[toks]) != ast.dump(new_entries[toks])
         ]
-        if not changed_keys:
+        same_order = list(old_entries) == list(new_entries)
+        if not changed_keys and same_order:
             return 0
         impact = self.impact
         mask = 0
+        changed_tokens = [t for toks in changed_keys for t in toks]
         for cls_key in impact.typing_dialects.get(path, ()):
-            if impact.read_at_import(cls_key, "EXPRESSION_METADATA", [t for toks in changed_keys for t in toks]):
+            if not same_order and (cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, "EXPRESSION_METADATA")):
+                return None
+            if changed_tokens and impact.read_at_import(cls_key, "EXPRESSION_METADATA", changed_tokens):
                 return None
             mask |= impact.dict_key_usage(cls_key, "EXPRESSION_METADATA", "*")
             for toks in changed_keys:
@@ -662,16 +676,24 @@ class Selector:
                 if old_parsed is not None and new_parsed is not None:
                     old_entries, old_spreads = old_parsed
                     new_entries, new_spreads = new_parsed
-                    # Same keys in the same order: iteration order is observable, and
-                    # key-only iteration is not recorded by the map.
-                    if old_spreads == new_spreads and list(old_entries) == list(new_entries):
+                    # _TrackedDict records key hits, not misses: key removals, reorderings (when
+                    # no import-time key iteration exists), and value edits are exact; added keys
+                    # fall back conservatively.
+                    if old_spreads == new_spreads and set(new_entries) <= set(old_entries):
+                        same_order = list(old_entries) == list(new_entries)
+                        if not same_order and (
+                            cls_key in impact.pre_hook_classes or impact.read_at_import(cls_key, attr)
+                        ):
+                            return None
                         changed_keys = [
-                            toks for toks in old_entries if ast.dump(old_entries[toks]) != ast.dump(new_entries[toks])
+                            toks
+                            for toks in old_entries
+                            if toks not in new_entries or ast.dump(old_entries[toks]) != ast.dump(new_entries[toks])
                         ]
-                        if not changed_keys:
+                        if not changed_keys and same_order:
                             return 0
                         changed_tokens = [tok for toks in changed_keys for tok in toks]
-                        if impact.read_at_import(cls_key, attr, changed_tokens):
+                        if changed_tokens and impact.read_at_import(cls_key, attr, changed_tokens):
                             return None
                         mask = impact.dict_key_usage(cls_key, attr, "*")
                         for toks in changed_keys:

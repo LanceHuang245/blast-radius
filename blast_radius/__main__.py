@@ -9,7 +9,7 @@ import sys
 
 from blast_radius import DATA, MAP_FILE, log
 from blast_radius.impact_map import ImpactMap
-from blast_radius.schedule import split
+from blast_radius.schedule import split, split_with_cost
 from blast_radius.select import Selection, Selector
 
 
@@ -28,26 +28,40 @@ def main() -> None:
     ms_by_number = {t["number"]: round(t["seconds"] * 1000) for t in tests}
 
     impact = ImpactMap(MAP_FILE)
-    # Uncalibrated tests: in-process CPU is ~1.3x the recorded seconds (median of calibrated ones).
+    # Uncalibrated tests are single-threaded unit/dialect tests whose measured in-process CPU
+    # averages ~0.68x of recorded seconds (heavy multiprocess optimizer tests are calibrated).
     cpu_by_number = {
-        t["number"]: impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 1300)) for t in tests
+        t["number"]: impact.real_cpu_ms.get(t["id"], round(t["seconds"] * 750)) for t in tests
     }
     selector = Selector(impact)
     numbers = [number_by_id.get(test_id) for test_id in impact.test_ids]
     mapped_ids = set(impact.test_ids)
     unmapped = [n for tid, n in number_by_id.items() if tid not in mapped_ids]
 
+    def _mask_cost_ms(mask: int) -> int:
+        picked = [(ms_by_number[numbers[i]], numbers[i]) for i in range(len(numbers)) if mask >> i & 1 and numbers[i] is not None]
+        return split_with_cost(picked)[0]
+
     # Phase 0: static selection across all commits.
     entries: list[tuple[str, set[int], Selection]] = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         sel = selector.select_detailed(patch.read_text(encoding="utf-8", errors="replace"))
         if sel.import_checks:
-            # An edited statement ran during other modules' imports: keep the narrow selection
-            # only if those modules build the same import-time state under the patch.
-            from blast_radius.verify import check_import_state
+            # An edited statement ran during other modules' imports: only pay the child-fork
+            # digest check when narrowing saves >= 400ms or unlocks Phase-2/per-case verification.
+            narrow_cost = _mask_cost_ms(sel.mask)
+            coarse_cost = narrow_cost if sel.coarse_mask == sel.mask else _mask_cost_ms(sel.coarse_mask)
+            worth_check = (coarse_cost - narrow_cost >= 400) or (
+                narrow_cost >= 2500 and (sel.hot_patch_targets is not None or sel.edited_spans is not None)
+            )
+            if worth_check and os.environ.get("BR_VERIFY", "1") != "0":
+                from blast_radius.verify import check_import_state
 
-            same = os.environ.get("BR_VERIFY", "1") != "0" and check_import_state(sel.patched_files, sel.import_checks)
-            log(f"{patch.stem}: import state of {sel.import_checks} {'unchanged' if same else 'CHANGED'}")
+                same = check_import_state(sel.patched_files, sel.import_checks)
+                log(f"{patch.stem}: import state of {sel.import_checks} {'unchanged' if same else 'CHANGED'}")
+            else:
+                same = False
+                log(f"{patch.stem}: import state check skipped (gain={coarse_cost - narrow_cost}ms)")
             if not same:
                 sel.mask, sel.lazy_pp_mask = sel.coarse_mask, 0
                 # Import-time state differs: a pre-warmed import would be stale, and the
