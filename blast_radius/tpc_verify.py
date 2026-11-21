@@ -227,7 +227,15 @@ def verify_optimized_tpch(patched_files: dict[str, str]) -> bool:
 
 
 def verify_max_nodes(patched_files: dict[str, str]) -> bool:
-    """Verify TestParser.test_max_nodes with fail-fast 50k check and token reuse (~11.8s local CPU)."""
+    """Verify TestParser.test_max_nodes without parsing its 10000-column query (~0.2s vs ~12s).
+
+    Every column of the test's `SELECT x=x=...=x, ...` is the same 202-token pattern, so the
+    parser counts the same number of nodes per column (100 at the pinned commit; the final
+    Select makes it 1_000_001, one over the 1M limit). Node counts of 1-3 column queries give
+    that number and show it is constant. Each limit is then checked by starting the node
+    counter a whole number of columns in and parsing only the few columns where the full
+    query crosses the limit, so the error trips at the same node as in the full parse.
+    """
     if "tests/test_parser.py" in patched_files:
         return False
     from sqlglot import Dialect, ParseError, exp, parse_one
@@ -248,35 +256,67 @@ def verify_max_nodes(patched_files: dict[str, str]) -> bool:
     width = 10000
     depth = 100
     expr = "x" + "=x" * depth
-    sql = f"SELECT {','.join(expr for _ in range(width))}"
     dialect = Dialect.get_or_raise(None)
 
-    tokenizer_touched = any(
-        p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/dialect.py")
-        for p in patched_files
-    )
-    if not tokenizer_touched:
-        sample_toks = dialect.tokenize(f"SELECT {expr},{expr}")
-        if len(sample_toks) != 404:
-            return False
-        toks = sample_toks[:202] + sample_toks[202:] * (width - 1)
-    else:
-        toks = dialect.tokenize(sql)
+    def prefix_sql(cols: int) -> str:
+        return f"SELECT {','.join(expr for _ in range(cols))}"
 
-    # Check max_nodes=50_000 first (~0.68s) to fail fast if max_nodes or parser is broken.
-    try:
-        dialect.parser(max_nodes=50_000).parse(toks, sql)
-        return False
-    except ParseError as err50:
-        if "(50000)" not in str(err50):
+    if any(p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py") for p in patched_files):
+        # A patched tokenizer: tokenize the whole query as the real test does, and check every
+        # column tokenizes to the same 202-token pattern.
+        toks = dialect.tokenize(prefix_sql(width))
+        if len(toks) != 202 * width:
             return False
+        pattern = [(tok.token_type, tok.text) for tok in toks[202:404]]
+        for col in range(2, width):
+            if [(tok.token_type, tok.text) for tok in toks[202 * col : 202 * (col + 1)]] != pattern:
+                return False
 
-    try:
-        dialect.parser(max_nodes=1_000_000).parse(toks, sql)
+    def node_count(cols: int) -> int:
+        parser = dialect.parser(max_nodes=10**12)
+        sql = prefix_sql(cols)
+        parser.parse(dialect.tokenize(sql), sql)
+        return parser._node_count
+
+    # Nodes per column must be constant, and enough for 10000 columns to exceed 1M.
+    c1, c2, c3 = node_count(1), node_count(2), node_count(3)
+    per_col = c2 - c1
+    if per_col <= 0 or c3 - c2 != per_col or c1 + (width - 1) * per_col <= 1_000_000:
         return False
-    except ParseError as err1m:
-        if "Maximum number of AST nodes" not in str(err1m):
-            return False
+
+    parser_cls = type(dialect.parser())
+    own_reset = parser_cls.__dict__.get("reset")
+    orig_reset = parser_cls.reset
+
+    def limit_error(skip_cols: int, parse_cols: int, max_nodes: int) -> str | None:
+        """parse_one of `parse_cols` columns with the counter starting `skip_cols` columns in."""
+
+        def fast_forward_reset(self) -> None:
+            orig_reset(self)
+            self._node_count = skip_cols * per_col
+
+        parser_cls.reset = fast_forward_reset
+        try:
+            parse_one(prefix_sql(parse_cols), max_nodes=max_nodes)
+            return None
+        except ParseError as error:
+            return str(error)
+        finally:
+            if own_reset is None:
+                del parser_cls.reset
+            else:
+                parser_cls.reset = own_reset
+
+    # 50k limit: the full query crosses it a few columns after 50_000 // per_col.
+    skip = max(0, 50_000 // per_col - 3)
+    err50 = limit_error(skip, min(6, width - skip), 50_000)
+    if err50 is None or "(50000)" not in err50:
+        return False
+
+    # 1M limit: the last columns of the full query, so trailing nodes (the Select) count too.
+    err1m = limit_error(width - 6, 6, 1_000_000)
+    if err1m is None or "Maximum number of AST nodes" not in err1m:
+        return False
 
     return True
 

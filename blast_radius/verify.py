@@ -24,7 +24,6 @@ import importlib.abc
 import importlib.machinery
 import inspect
 import io
-import json
 import os
 import pickle
 import select
@@ -480,11 +479,8 @@ def _est_test_cpu_ms(
     if tid == OPT_TPCH_TEST_ID and _can_fast_opt_tpch(sel):
         return 100
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
-        tok_touched = any(
-            p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/dialects/dialect.py")
-            for p in sel.patched_files
-        )
-        return 16500 if tok_touched else 11800
+        tok_touched = any(p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py") for p in sel.patched_files)
+        return 16500 if tok_touched else 400
     if tid == GEN_MEM_TEST_ID:
         can_fast, is_scoped = _can_fast_gen_mem(sel)
         if can_fast and is_scoped:
@@ -651,6 +647,12 @@ def _start_child_verification(
                         signal.alarm(0)
             return _run_unittest(num)
 
+        def _mark(num: int, ok: bool) -> bool:
+            """Record a verdict and stream it at once, so a timeout or crash keeps the passes so far."""
+            (passed if ok else failed).add(num)
+            os.write(w_fd, f"{'P' if ok else 'F'} {num}\n".encode())
+            return ok
+
         # Step 1: If pushdown_predicates.py:36-37 lazy imports inflated `chosen`, verify clean import in ~10ms.
         if task.lazy_pp_nums:
             ok_lazy = False
@@ -662,7 +664,8 @@ def _start_child_verification(
             finally:
                 signal.alarm(0)
             if ok_lazy:
-                passed.update(task.lazy_pp_nums)
+                for num in task.lazy_pp_nums:
+                    _mark(num, True)
 
         verifiable = {
             n for n in (task.chosen - passed) if id_by_number[n] not in SUBPROCESS_TESTS
@@ -701,10 +704,7 @@ def _start_child_verification(
 
             # Step 2a: Fail-fast probe on cheap unit tests.
             for num in probe_tests:
-                if _run_candidate(num):
-                    passed.add(num)
-                else:
-                    failed.add(num)
+                if not _mark(num, _run_candidate(num)):
                     break
 
             # Step 2b: Makespan decapitation on heavy bottleneck tests (even after probe failure
@@ -716,8 +716,9 @@ def _start_child_verification(
                 tid = id_by_number[num]
                 t_cpu = _est_test_cpu_ms(num, tid, sel, task.tpc_mode, cpu_by_number)
                 if failed:
-                    # Do not spend heavy TPC CPU once a unit probe already failed on this commit.
-                    if tid in TPC_SUITE_BY_TEST_ID:
+                    # A broken commit can still leave TPC passing; only the cheap fail-fast
+                    # fast_a check is worth the gamble once a unit probe already failed.
+                    if tid in TPC_SUITE_BY_TEST_ID and task.tpc_mode != "fast_a":
                         continue
                     # For non-TPC decap targets after a probe failure, require strong standalone ROI.
                     cur_pool = task.chosen - passed
@@ -739,10 +740,7 @@ def _start_child_verification(
                     if (cur_c - without_rem_c) - rem_cpu < MIN_GAIN_MS:
                         continue
 
-                if _run_candidate(num):
-                    passed.add(num)
-                else:
-                    failed.add(num)
+                _mark(num, _run_candidate(num))
 
             # Step 2c: If no failures so far, verify remaining tail if dropping it beats its real CPU.
             if not failed and tail_tests:
@@ -764,10 +762,7 @@ def _start_child_verification(
                         ):
                             break
                         unverified.discard(num)
-                        if _run_candidate(num):
-                            passed.add(num)
-                        else:
-                            failed.add(num)
+                        _mark(num, _run_candidate(num))
         elif verifiable:
             rem_cpus = [cpu_by_number[n] for n in verifiable]
             if not task.lazy_pp_nums or (
@@ -784,13 +779,7 @@ def _start_child_verification(
                     ):
                         break
                     unverified.discard(num)
-                    if _run_candidate(num):
-                        passed.add(num)
-                    else:
-                        failed.add(num)
-
-        payload = json.dumps({"passed": sorted(passed), "failed": sorted(failed)}).encode("utf-8")
-        os.write(w_fd, payload)
+                    _mark(num, _run_candidate(num))
     except BaseException:
         pass
     finally:
@@ -1067,38 +1056,37 @@ def _run_batch_parallel(
 
     def finish_child(r_fd: int, timed_out: bool) -> None:
         pid, task, limit_deadline, chunks = active.pop(r_fd)
-        try:
-            os.close(r_fd)
-        except OSError:
-            pass
         if timed_out:
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        # Drain what the child streamed before it exited or was killed: each "P n" line is a
+        # test that ran to completion and passed, so it stays valid after a kill or crash.
+        try:
+            while chunk := os.read(r_fd, 65536):
+                chunks.append(chunk)
+        except OSError:
+            pass
+        os.close(r_fd)
         _, status, rusage = os.wait4(pid, 0)
-        if timed_out:
-            log(f"{task.commit}: verify killed after timeout p{task.phase}")
-            verified[task.commit] = task.chosen
-            return
         child_cpu = rusage.ru_utime + rusage.ru_stime
         raw = b"".join(chunks)
-        if not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0 or not raw or raw == b"FAIL_PATCH":
-            log(f"{task.commit}: verify fallback p{task.phase} ({child_cpu:.3f}s, status={status})")
+        if raw.startswith(b"FAIL_PATCH"):
+            log(f"{task.commit}: verify fallback p{task.phase} ({child_cpu:.3f}s, patch not applied)")
             verified[task.commit] = task.chosen
             return
-        try:
-            data = json.loads(raw)
-            passed_set = set(data["passed"])
-            mtag = f" tpc={task.tpc_mode}" if task.tpc_mode else ""
-            dtag = f" decap={len(task.decap_targets)}" if task.decap_targets else ""
-            log(
-                f"{task.commit}: p{task.phase}{mtag}{dtag} cpu={child_cpu:.3f}s "
-                f"pass={len(passed_set)} fail={len(data['failed'])}/{len(task.chosen)}"
-            )
-            verified[task.commit] = task.chosen - passed_set
-        except Exception:
-            verified[task.commit] = task.chosen
+        lines = raw.split(b"\n")
+        passed_set = {int(line[2:]) for line in lines if line.startswith(b"P ")}
+        n_failed = sum(1 for line in lines if line.startswith(b"F "))
+        mtag = f" tpc={task.tpc_mode}" if task.tpc_mode else ""
+        dtag = f" decap={len(task.decap_targets)}" if task.decap_targets else ""
+        end = " TIMEOUT" if timed_out else ("" if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else f" status={status}")
+        log(
+            f"{task.commit}: p{task.phase}{mtag}{dtag} cpu={child_cpu:.3f}s "
+            f"pass={len(passed_set)} fail={n_failed}/{len(task.chosen)}{end}"
+        )
+        verified[task.commit] = task.chosen - passed_set
 
     while queue or active:
         # Run 1 child at a time initially to avoid SMT cache contention (+0.7s CPU);
