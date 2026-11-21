@@ -117,6 +117,10 @@ class VerifyTask:
     tpc_mode: str | None = None
     lazy_pp_nums: set[int] = field(default_factory=set)
     decap_targets: list[int] = field(default_factory=list)
+    # Fixture-mapped tests: the (fixture file, index) cases the edit reaches, and the CPU
+    # estimates scaled down to running just those.
+    case_filter: dict[int, set[tuple[str, int]]] = field(default_factory=dict)
+    cpu_override: dict[int, int] = field(default_factory=dict)
 
 
 class _LazyFuture(cf.Future):
@@ -483,6 +487,36 @@ def _install_fail_fast_subtest() -> None:
     unittest.TestCase.subTest = _ff_subtest
 
 
+_CASE_STATE: dict = {"allowed": None, "in_check": False}
+
+
+def _install_case_filter(mod) -> None:
+    """While a fixture-mapped test runs, let TestOptimizer.check_file see only the allowed
+    (fixture file, index) cases (see blast_radius.precompile_cases)."""
+    if getattr(mod, "_br_case_filter", False):
+        return
+    mod._br_case_filter = True
+    orig_loader = mod.load_sql_fixture_pairs
+
+    def loader(filename):
+        allowed = _CASE_STATE["allowed"] if _CASE_STATE["in_check"] else None
+        for index, item in enumerate(orig_loader(filename)):
+            if allowed is None or (filename, index) in allowed:
+                yield item
+
+    mod.load_sql_fixture_pairs = loader
+    orig_check_file = mod.TestOptimizer.check_file
+
+    def check_file(self, *args, **kwargs):
+        _CASE_STATE["in_check"] = True
+        try:
+            return orig_check_file(self, *args, **kwargs)
+        finally:
+            _CASE_STATE["in_check"] = False
+
+    mod.TestOptimizer.check_file = check_file
+
+
 def _can_fast_opt_tpch(sel: Selection) -> bool:
     return not any(
         p in ("tests/test_executor.py", "tests/helpers.py") or p.startswith("tests/fixtures/")
@@ -534,31 +568,42 @@ def _est_test_cpu_ms(
     return cpu_by_number[num]
 
 
-def _should_continue_after_failure(
-    cur_pool: set[int],
-    unverified_ordered: list[int],
+def _lb_cost(total: int, biggest: int, count: int) -> int:
+    """Lower bound of a commit's cost for tests summing `total` ms (largest `biggest`)."""
+    if count <= 0 or total <= 0:
+        return 0
+    return min(max(biggest, -(-total // k)) + 2000 * k for k in range(1, min(8, count) + 1))
+
+
+def _best_drop_prefix(
+    pool: set[int],
+    candidates,
     ms_by_number: dict[int, int],
     cpu_by_number: dict[int, int],
-) -> bool:
-    """Return True if any prefix of `unverified_ordered` (sorted tallest-first) nets >= 80ms in an active child."""
-    if not unverified_ordered:
-        return False
-    first = unverified_ordered[0]
-    if cpu_by_number[first] >= ms_by_number[first]:
-        return False
-    cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
-    trial = set(cur_pool)
-    acc_cpu = 0
-    for num in unverified_ordered:
-        c_ms = cpu_by_number[num]
-        if c_ms >= ms_by_number[num]:
-            break
-        trial.discard(num)
-        acc_cpu += c_ms
-        new_cost, _ = split_with_cost([(ms_by_number[n], n) for n in trial])
-        if (cur_cost - new_cost) - acc_cpu >= 80:
-            return True
-    return False
+    min_gain: int,
+    limit: int = 200,
+) -> list[int]:
+    """Candidates worth verifying to drop from `pool`: the prefix, cheapest CPU per saved ms
+    first, with the best net (cost saved minus CPU spent), if that net reaches `min_gain`."""
+    order = sorted(candidates, key=lambda n: (cpu_by_number[n] / max(ms_by_number[n], 1), -ms_by_number[n], n))
+    desc = sorted(pool, key=lambda n: -ms_by_number[n])
+    total = sum(ms_by_number[n] for n in pool)
+    count = len(pool)
+    current = _lb_cost(total, ms_by_number[desc[0]] if desc else 0, count)
+    removed: set[int] = set()
+    best_net, best, prefix, spent, top = min_gain - 1, [], [], 0, 0
+    for num in order[:limit]:
+        removed.add(num)
+        prefix.append(num)
+        total -= ms_by_number[num]
+        count -= 1
+        spent += cpu_by_number[num]
+        while top < len(desc) and desc[top] in removed:
+            top += 1
+        net = current - _lb_cost(total, ms_by_number[desc[top]] if top < len(desc) else 0, count) - spent
+        if net > best_net:
+            best_net, best = net, list(prefix)
+    return best
 
 
 def _has_decap_prefix_roi(
@@ -613,6 +658,7 @@ def _start_child_verification(
             pass
     try:
         gc.enable()
+        cpu_by_number = {**cpu_by_number, **task.cpu_override}
         os.chdir(SOURCE)
         if str(SOURCE) not in sys.path:
             sys.path.insert(0, str(SOURCE))
@@ -679,6 +725,8 @@ def _start_child_verification(
                     mod = importlib.import_module(mod_name)
                     if mod_name in ("tests.test_optimizer", "tests.test_executor"):
                         _patch_pool_references()
+                    if mod_name == "tests.test_optimizer":
+                        _install_case_filter(mod)
                     cls = getattr(mod, cls_name)
                     if cls_name == "TestExecutor" and not executor_patched:
                         _install_lazy_executor_setup(cls)
@@ -688,11 +736,13 @@ def _start_child_verification(
                         setup_done.add(cls)
                 cls = loaded_classes[key]
                 res = unittest.TestResult()
+                _CASE_STATE["allowed"] = task.case_filter.get(num)
                 cls(meth_name).run(res)
                 ok = res.wasSuccessful()
             except BaseException:
                 ok = False
             finally:
+                _CASE_STATE["allowed"] = None
                 signal.alarm(0)
             return ok
 
@@ -789,15 +839,12 @@ def _start_child_verification(
                 ),
             )
             probe_tests: list[int] = []
-            tail_tests: list[int] = []
             probe_cpu = 0
             for num in other_ordered:
                 c_ms = cpu_by_number[num]
                 if need_probe and c_ms <= 450 and probe_cpu + c_ms <= TPC_PROBE_BUDGET_MS:
                     probe_tests.append(num)
                     probe_cpu += c_ms
-                else:
-                    tail_tests.append(num)
 
             # Step 2a: Fail-fast probe on cheap unit tests.
             for num in probe_tests:
@@ -829,58 +876,16 @@ def _start_child_verification(
                     continue
                 _mark(num, _run_candidate(num))
 
-            # Step 2c: If no failures so far, verify remaining tail if dropping it beats its real CPU.
-            if not failed and tail_tests:
-                tail_cpus = [cpu_by_number[n] for n in tail_tests]
-                cur_pool = task.chosen - passed
-                cur_c, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
-                after_tail_c, _ = split_with_cost(
-                    [(ms_by_number[n], n) for n in (cur_pool - set(tail_tests))]
+        # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
+        # each failure (a failing test stays, but the rest may still be worth dropping).
+        if not (sel.fixture_only and not VERIFY_FIXTURE_MAX_MS):
+            for _ in range(4):
+                batch = _best_drop_prefix(
+                    task.chosen - passed, verifiable - passed - failed - decap_set,
+                    ms_by_number, cpu_by_number, MIN_GAIN_MS,
                 )
-                if (
-                    max(tail_cpus) <= MAX_SINGLE_TEST_MS
-                    and sum(tail_cpus) <= MAX_COMMIT_VERIFY_MS
-                    and (cur_c - after_tail_c) - sum(tail_cpus) >= MIN_GAIN_MS
-                ):
-                    unverified = set(tail_tests)
-                    for num in tail_tests:
-                        if num not in unverified:
-                            continue
-                        if failed:
-                            break
-                        unverified.discard(num)
-                        _mark(num, _run_candidate(num))
-                    if failed and unverified:
-                        for num in sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n])):
-                            rem_list = sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n]))
-                            if not _should_continue_after_failure(task.chosen - passed, rem_list, ms_by_number, cpu_by_number):
-                                break
-                            unverified.discard(num)
-                            _mark(num, _run_candidate(num))
-        elif verifiable:
-            rem_cpus = [cpu_by_number[n] for n in verifiable]
-            if not task.lazy_pp_nums or (
-                max(rem_cpus) <= MAX_SINGLE_TEST_MS and sum(rem_cpus) <= MAX_COMMIT_VERIFY_MS
-            ):
-                ordered = sorted(
-                    verifiable,
-                    key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
-                )
-                unverified = set(ordered)
-                for num in ordered:
-                    if num not in unverified:
-                        continue
-                    if failed:
-                        break
-                    unverified.discard(num)
-                    _mark(num, _run_candidate(num))
-                if failed and unverified:
-                    for num in sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n])):
-                        rem_list = sorted(unverified, key=lambda n: (-ms_by_number[n], cpu_by_number[n], id_by_number[n]))
-                        if not _should_continue_after_failure(task.chosen - passed, rem_list, ms_by_number, cpu_by_number):
-                            break
-                        unverified.discard(num)
-                        _mark(num, _run_candidate(num))
+                if not batch or all(_mark(num, _run_candidate(num)) for num in batch):
+                    break
     except BaseException:
         pass
     finally:
@@ -891,11 +896,52 @@ def _start_child_verification(
         os._exit(0)
 
 
+def _budget_scale(n_commits: int) -> float:
+    """Budgets are sized for a 30-commit batch; the run's time limit grows with the batch
+    (3 minutes in practice, 4.5 for the ~1.5x larger final)."""
+    return max(1.0, n_commits / 30)
+
+
+_CASE_MAP: dict | None = None
+
+
+def _case_plan(
+    chosen: set[int],
+    sel: Selection,
+    id_by_number: dict[int, str],
+    base_cpu: dict[int, int],
+) -> tuple[dict[int, set[tuple[str, int]]], dict[int, int]]:
+    """For fixture-mapped tests, the cases reaching the edited spans and scaled CPU estimates."""
+    global _CASE_MAP
+    if sel.edited_spans is None:
+        return {}, {}
+    if _CASE_MAP is None:
+        from blast_radius.precompile_cases import CASES_FILE
+
+        _CASE_MAP = marshal.loads(CASES_FILE.read_bytes()) if CASES_FILE.is_file() else {}
+    case_filter: dict[int, set[tuple[str, int]]] = {}
+    cpu_override: dict[int, int] = {}
+    for num in chosen:
+        entry = _CASE_MAP.get(id_by_number[num])
+        if entry is None:
+            continue
+        mask = 0
+        for path, first, last in sel.edited_spans:
+            per_line = entry["lines"].get(path)
+            if per_line:
+                for line in range(first, last + 1):
+                    mask |= per_line.get(line, 0)
+        cases = entry["cases"]
+        case_filter[num] = {tuple(cases[k]) for k in range(len(cases)) if mask >> k & 1}
+        cpu_override[num] = max(20, base_cpu[num] * (len(case_filter[num]) + 1) // (len(cases) + 1))
+    return case_filter, cpu_override
+
+
 def plan_verification(
     commits: list[tuple[str, set[int], Selection]],
     id_by_number: dict[int, str],
     ms_by_number: dict[int, int],
-    cpu_by_number: dict[int, int],
+    base_cpu: dict[int, int],
     number_by_index: list[int | None] | None = None,
 ) -> tuple[list[VerifyTask], list[VerifyTask]]:
     """Select and prioritize commits worth runtime verification or makespan decapitation."""
@@ -903,6 +949,8 @@ def plan_verification(
     for commit, chosen, sel in commits:
         if not chosen or not sel.patched_files or sel.reason.startswith("everything"):
             continue
+        case_filter, cpu_override = _case_plan(chosen, sel, id_by_number, base_cpu)
+        cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else base_cpu
         tids = [id_by_number[n] for n in chosen]
         verifiable = {n for n in chosen if id_by_number[n] not in SUBPROCESS_TESTS}
         if not verifiable:
@@ -990,67 +1038,36 @@ def plan_verification(
         # Keep selected decap targets ordered tallest-first so dominant ceilings are knocked down first.
         decap_targets = list(best_prefix)
         decap_set = set(decap_targets)
-        tail_nums = rem_verifiable - decap_set
-        tail_cpus = [cpu_by_number[n] for n in tail_nums]
+        # Tail: the other verifiable tests worth dropping, as the best ROI prefix (the child
+        # re-plans the same way as results come in, failures included).
+        def plan_tail(pool: set[int], cands: set[int]) -> tuple[list[int], int]:
+            if sel.fixture_only and not VERIFY_FIXTURE_MAX_MS:
+                return [], 0  # a fixture edit almost always breaks the tests reading it
+            prefix = _best_drop_prefix(pool, cands, ms_by_number, cpu_by_number, MIN_GAIN_MS)
+            return prefix, sum(cpu_by_number[n] for n in prefix)
 
-        if decap_targets or lazy_pp_nums:
-            decap_cpu = sum(
-                _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number)
-                for n in decap_targets
-            ) + (15 if lazy_pp_nums else 0)
-            pool_after_decap = chosen - lazy_pp_nums - decap_set
-            cost_after_decap, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_decap])
-            pool_after_all = pool_after_decap - tail_nums
-            cost_after_all, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_all])
-
-            can_verify_tail = (
-                bool(tail_nums)
-                and not (sel.fixture_only and sum(tail_cpus) > VERIFY_FIXTURE_MAX_MS)
-                and max(tail_cpus) <= MAX_SINGLE_TEST_MS
-                and sum(tail_cpus) <= MAX_COMMIT_VERIFY_MS
-                and (cost_after_decap - cost_after_all) - sum(tail_cpus) >= MIN_GAIN_MS
-            )
-            if can_verify_tail:
-                est_cpu_ms = overhead_ms + decap_cpu + sum(tail_cpus)
-                expected_gain_ms = (static_cost_ms - cost_after_all) - est_cpu_ms
-            else:
-                probe_ms = min(sum(tail_cpus), TPC_PROBE_BUDGET_MS) if decap_targets else 0
-                est_cpu_ms = overhead_ms + probe_ms + decap_cpu
-                expected_gain_ms = (static_cost_ms - cost_after_decap) - est_cpu_ms
-
-            has_heavy_tpc_or_max = any(
-                id_by_number[n] in TPC_SUITE_BY_TEST_ID or id_by_number[n] == MAX_NODES_TEST_ID
-                for n in decap_targets
-            )
-            min_req = TPC_MIN_GAIN_MS if has_heavy_tpc_or_max else MIN_DECAP_GAIN_MS
-            if lazy_pp_nums and not decap_targets:
-                min_req = MIN_GAIN_MS
-            if expected_gain_ms < min_req:
-                # Fallback: check if the whole commit qualifies as a small normal commit without decap.
-                if not tail_nums or max(tail_cpus) > MAX_SINGLE_TEST_MS or sum(tail_cpus) > MAX_COMMIT_VERIFY_MS:
-                    continue
-                all_cpus = [cpu_by_number[n] for n in verifiable]
-                if max(all_cpus) > MAX_SINGLE_TEST_MS or sum(all_cpus) > MAX_COMMIT_VERIFY_MS:
-                    continue
-                if sel.fixture_only and sum(all_cpus) > VERIFY_FIXTURE_MAX_MS:
-                    continue
-                decap_targets = []
-                est_cpu_ms = overhead_ms + sum(all_cpus)
-                after_c, _ = split_with_cost([(ms_by_number[n], n) for n in (chosen - verifiable)])
-                expected_gain_ms = (static_cost_ms - after_c) - est_cpu_ms
-                if expected_gain_ms < MIN_GAIN_MS:
-                    continue
-        else:
-            all_cpus = [cpu_by_number[n] for n in verifiable]
-            if max(all_cpus) > MAX_SINGLE_TEST_MS or sum(all_cpus) > MAX_COMMIT_VERIFY_MS:
-                continue
-            if sel.fixture_only and sum(all_cpus) > VERIFY_FIXTURE_MAX_MS:
-                continue
-            est_cpu_ms = overhead_ms + sum(all_cpus)
-            after_c, _ = split_with_cost([(ms_by_number[n], n) for n in (chosen - verifiable)])
-            expected_gain_ms = (static_cost_ms - after_c) - est_cpu_ms
-            if expected_gain_ms < MIN_GAIN_MS:
-                continue
+        decap_cpu = sum(
+            _est_test_cpu_ms(n, id_by_number[n], sel, tpc_mode, cpu_by_number) for n in decap_targets
+        ) + (15 if lazy_pp_nums else 0)
+        pool_after_decap = chosen - lazy_pp_nums - decap_set
+        tail_prefix, tail_cpu = plan_tail(pool_after_decap, rem_verifiable - decap_set)
+        cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in pool_after_decap - set(tail_prefix)])
+        est_cpu_ms = overhead_ms + decap_cpu + tail_cpu
+        expected_gain_ms = (static_cost_ms - cost_after) - est_cpu_ms
+        has_heavy_tpc_or_max = any(
+            id_by_number[n] in TPC_SUITE_BY_TEST_ID or id_by_number[n] == MAX_NODES_TEST_ID for n in decap_targets
+        )
+        min_req = TPC_MIN_GAIN_MS if has_heavy_tpc_or_max else MIN_DECAP_GAIN_MS if decap_targets else MIN_GAIN_MS
+        if expected_gain_ms < min_req and decap_targets:
+            # Without the decapitation targets, the tail alone may still pay off.
+            decap_targets = []
+            tail_prefix, tail_cpu = plan_tail(chosen - lazy_pp_nums, rem_verifiable)
+            cost_after, _ = split_with_cost([(ms_by_number[n], n) for n in chosen - lazy_pp_nums - set(tail_prefix)])
+            est_cpu_ms = overhead_ms + (15 if lazy_pp_nums else 0) + tail_cpu
+            expected_gain_ms = (static_cost_ms - cost_after) - est_cpu_ms
+            min_req = MIN_GAIN_MS
+        if not (decap_targets or tail_prefix or lazy_pp_nums) or expected_gain_ms < min_req:
+            continue
 
         candidates.append(
             VerifyTask(
@@ -1064,6 +1081,8 @@ def plan_verification(
                 tpc_mode=tpc_mode,
                 lazy_pp_nums=lazy_pp_nums,
                 decap_targets=decap_targets,
+                case_filter=case_filter,
+                cpu_override=cpu_override,
             )
         )
 
@@ -1072,10 +1091,11 @@ def plan_verification(
         key=lambda t: (-t.expected_gain_ms / max(t.est_cpu_ms, 1), t.commit)
     )
     budget_used = 0
+    budget = TOTAL_VERIFY_BUDGET_MS * _budget_scale(len(commits))
     phase1: list[VerifyTask] = []
     phase2: list[VerifyTask] = []
     for task in candidates:
-        if budget_used + task.est_cpu_ms > TOTAL_VERIFY_BUDGET_MS:
+        if budget_used + task.est_cpu_ms > budget:
             continue
         budget_used += task.est_cpu_ms
         if task.phase == 1:
@@ -1152,6 +1172,7 @@ def _run_batch_parallel(
     out_fd: int | None,
     stop_at: float,
     verified: dict[str, set[int]],
+    started: float,
 ) -> None:
     """Run a batch of independent forked verification tasks with up to MAX_PARALLEL_CHILDREN concurrency."""
     queue = list(tasks)
@@ -1195,7 +1216,7 @@ def _run_batch_parallel(
     while queue or active:
         # Run 1 child at a time initially to avoid SMT cache contention (+0.7s CPU);
         # automatically scale to 2-core parallelism if wall-clock elapsed exceeds 35s.
-        cur_limit = max(1, MAX_PARALLEL_CHILDREN) if (stop_at - time.monotonic() < VERIFY_WALL_BUDGET_S - 35.0) else 1
+        cur_limit = max(1, MAX_PARALLEL_CHILDREN) if time.monotonic() - started > 35.0 else 1
         while queue and len(active) < cur_limit:
             now = time.monotonic()
             remaining = stop_at - now
@@ -1247,6 +1268,7 @@ def verify_batches(
     ms_by_number: dict[int, int],
     out_fd: int | None,
     cpu_by_number: dict[int, int] | None = None,
+    n_commits: int = 30,
 ) -> dict[str, set[int]]:
     """Run Phase-1 (clean fork) then Phase-2 (pre-warmed hot-patch fork) verification."""
     verified: dict[str, set[int]] = {}
@@ -1284,13 +1306,15 @@ def verify_batches(
             except Exception:
                 pass
 
-    stop_at = time.monotonic() + VERIFY_WALL_BUDGET_S
+    # Capped well inside the final's 270 s limit.
+    started = time.monotonic()
+    stop_at = started + min(VERIFY_WALL_BUDGET_S * _budget_scale(n_commits), 200.0)
 
     if phase1:
-        _run_batch_parallel(phase1, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified)
+        _run_batch_parallel(phase1, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified, started)
 
     if phase2 and time.monotonic() < stop_at:
         _prewarm_for_phase2(phase2, id_by_number, ms_by_number, cpu_by_number)
-        _run_batch_parallel(phase2, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified)
+        _run_batch_parallel(phase2, id_by_number, ms_by_number, cpu_by_number, out_fd, stop_at, verified, started)
 
     return verified

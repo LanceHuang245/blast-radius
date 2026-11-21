@@ -47,6 +47,9 @@ class Selection:
     # state digests are unchanged under the patch, else `coarse_mask` applies.
     import_checks: list[str] = field(default_factory=list)
     coarse_mask: int = 0
+    # Every change resolved to these sqlglot statement spans (path, first, last), or None when
+    # some change was resolved otherwise: lets the verifier rerun only fixture cases that reach them.
+    edited_spans: list[tuple[str, int, int]] | None = None
 
 
 def _decorator_name(node: ast.expr) -> str | None:
@@ -225,6 +228,8 @@ class Selector:
         self._coarse_block: bool = False
         self._no_import_check: bool = False
         self._no_verify: bool = False
+        self._spans: list[tuple[str, int, int]] = []
+        self._spans_ok: bool = True
         self._owner_checks: set[str] = set()
         self._state = marshal.loads(STATE_FILE.read_bytes()) if STATE_FILE.is_file() else None
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
@@ -259,6 +264,7 @@ class Selector:
             self._hit_pp_lazy = False
             self._owner_checks = set()
             self._no_verify = False
+            self._spans, self._spans_ok = [], True
             for file_patch in files:
                 file_mask, is_noop, is_fixture_or_comment, f_targets, a_targets = self.select_file_detailed(
                     file_patch, patched_files
@@ -274,6 +280,8 @@ class Selector:
                         hot_targets.extend(f_targets)
                     if attr_targets is not None and a_targets:
                         attr_targets.extend(a_targets)
+            # The extra passes below re-select with other settings: keep this pass's spans.
+            spans = list(dict.fromkeys(self._spans)) if self._spans_ok else None
             if self._hit_pp_lazy and mask:
                 self._no_pp_lazy = True
                 try:
@@ -309,6 +317,7 @@ class Selector:
                 lazy_pp_mask=lazy_pp_mask,
                 import_checks=owners,
                 coarse_mask=coarse_mask,
+                edited_spans=spans,
             )
         except Everything as reason:
             return Selection(impact.everything, f"everything ({reason})", {}, None, None, False)
@@ -334,6 +343,8 @@ class Selector:
         list[tuple[str, str, str, object]] | None,
     ]:
         impact = self.impact
+        if not (fp.new and fp.new == fp.old and not fp.binary and fp.new.startswith("sqlglot/") and fp.new.endswith(".py")):
+            self._spans_ok = False  # only in-place sqlglot .py edits resolve to statement spans
         if fp.binary or (fp.old is not None and fp.new is not None and fp.old != fp.new) or fp.new is None:
             # Binary, renamed or deleted: the in-memory overlay cannot reproduce these, so this
             # commit is not verified; select what imports or reads the old path (a module that
@@ -430,6 +441,7 @@ class Selector:
             compile(new_tree, path, "exec", dont_inherit=True)
         except (SyntaxError, ValueError):
             # The module cannot import: exactly what an import-time change reaches fails.
+            self._spans_ok = False
             return self.impact.module_level(path), False, new_text, None, None
         new_scopes = Scopes(new_tree, has_lambda="lambda" in new_text)
 
@@ -493,11 +505,13 @@ class Selector:
         if path in self.impact.typing_dialects:
             t_mask = self.typing_dict_level(path, old_scopes, new_scopes, removed, added)
             if t_mask is not None:
+                self._spans_ok = False
                 return t_mask
 
         # Try fine-grained class dict-key or class attribute tracking first.
         attr_mask = self.class_attr_level(path, module, old_scopes, new_scopes, removed, added)
         if attr_mask is not None:
+            self._spans_ok = False
             return attr_mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
 
         # One-for-one edit of statements inside one function: the tests that ran them.
@@ -512,6 +526,7 @@ class Selector:
             return ast_mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
 
         self._coarse_block = True
+        self._spans_ok = False
         mask = 0
         for lineno, _ in removed:
             mask |= self.old_line(path, module, old_scopes, lineno)
@@ -725,6 +740,7 @@ class Selector:
             # imports built, which the runtime re-checks (else the coarse selection is used,
             # and hot-patching is dropped).
             self._owner_checks |= owners
+        self._spans.append((path, first, last))
         return self.impact.span(path, first, last)
 
     def _import_owners(self, path: str, first: int, last: int) -> set[str] | None:

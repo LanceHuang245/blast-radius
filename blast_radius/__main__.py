@@ -50,8 +50,9 @@ def main() -> None:
             log(f"{patch.stem}: import state of {sel.import_checks} {'unchanged' if same else 'CHANGED'}")
             if not same:
                 sel.mask, sel.lazy_pp_mask = sel.coarse_mask, 0
-                # Import-time state differs: a pre-warmed import would be stale.
-                sel.hot_patch_targets, sel.attr_hot_targets = None, None
+                # Import-time state differs: a pre-warmed import would be stale, and the
+                # changes reach tests beyond the edited statements.
+                sel.hot_patch_targets, sel.attr_hot_targets, sel.edited_spans = None, None, None
         chosen = {numbers[i] for i in range(len(numbers)) if sel.mask >> i & 1 and numbers[i] is not None}
         if unmapped and sel.reason != "noop":
             chosen.update(unmapped)
@@ -64,7 +65,7 @@ def main() -> None:
         from blast_radius.verify import plan_verification, verify_batches
 
         phase1, phase2 = plan_verification(entries, id_by_number, ms_by_number, cpu_by_number, numbers)
-        verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd, cpu_by_number)
+        verified = verify_batches(phase1, phase2, id_by_number, ms_by_number, out_fd, cpu_by_number, len(entries))
 
     for commit, chosen, sel in entries:
         final_chosen = verified.get(commit, chosen)
