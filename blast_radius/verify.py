@@ -39,19 +39,36 @@ from blast_radius import SOURCE, log
 from blast_radius.impact_map import module_name
 from blast_radius.schedule import split_with_cost
 from blast_radius.select import Selection
+from blast_radius.tpc_verify import (
+    TPC_EST_CPU_MS,
+    TPC_SUITE_BY_TEST_ID,
+    select_tpc_mode,
+    verify_tpc_test,
+)
 
 # Decision thresholds (overridable via env vars for local A/B benchmarking).
 MAX_SINGLE_TEST_MS = int(os.environ.get("BR_MAX_SINGLE_MS", "2500"))
 MAX_COMMIT_VERIFY_MS = int(os.environ.get("BR_MAX_COMMIT_MS", "2500"))
 MIN_GAIN_MS = int(os.environ.get("BR_MIN_GAIN_MS", "350"))
 VERIFY_FIXTURE_MAX_MS = int(os.environ.get("BR_FIXTURE_MAX_MS", "0"))
-TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "35000"))
+TOTAL_VERIFY_BUDGET_MS = int(os.environ.get("BR_TOTAL_BUDGET_MS", "90000"))
 ENABLE_HOTPATCH = os.environ.get("BR_ENABLE_HOTPATCH", "1") != "0"
+ENABLE_TPC_FAST = os.environ.get("BR_ENABLE_TPC_FAST", "1") != "0"
+ENABLE_TPC_FAST_B = os.environ.get("BR_ENABLE_TPC_FAST_B", "1") != "0"
+TPC_PROBE_BUDGET_MS = int(os.environ.get("BR_TPC_PROBE_MS", "300"))
+TPC_MIN_GAIN_MS = int(os.environ.get("BR_TPC_MIN_GAIN_MS", "2000"))
 
 # Hard wall-clock limits, enforced by the parent (the run itself has 3 minutes, 4.5 in the final).
 CHILD_LIMIT_BASE_S = 5.0  # per child: base + factor x estimated CPU
 CHILD_LIMIT_FACTOR = 3.0
-VERIFY_WALL_BUDGET_S = float(os.environ.get("BR_VERIFY_WALL_S", "60"))
+VERIFY_WALL_BUDGET_S = float(os.environ.get("BR_VERIFY_WALL_S", "120"))
+
+# Tests in TestExecutor that actually use numpy/pandas/TPC fixtures.
+TPC_EXECUTOR_TESTS = frozenset({
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+})
 
 # Tests that inspect fresh import state or spawn subprocesses must never run in Phase 2.
 FRESH_IMPORT_TESTS = frozenset({
@@ -84,6 +101,8 @@ class VerifyTask:
     phase: int  # 1 = clean fork, 2 = pre-warmed fork
     static_cost_ms: int
     est_cpu_ms: int
+    expected_gain_ms: int = 0
+    tpc_mode: str | None = None
 
 
 class _InProcessExecutor:
@@ -294,6 +313,53 @@ def _install_lazy_executor_setup(cls: type) -> None:
         setattr(cls, attr_name, _LazyAttr(attr_name))
 
 
+def _install_lazy_data_libs() -> None:
+    """Defer importing numpy and pandas until actually accessed by a test.
+
+    tests/test_executor.py imports numpy and pandas at module top level only for
+    its 3 TPC-H/TPC-DS tests; the other 57 TestExecutor unit tests never touch them.
+    """
+    if "numpy" in sys.modules or "pandas" in sys.modules:
+        return
+
+    stub_names = ("numpy", "pandas", "pandas.testing")
+
+    def _load_real(name: str) -> types.ModuleType:
+        for s in stub_names:
+            mod = sys.modules.get(s)
+            if getattr(mod, "_br_lazy_stub", False):
+                sys.modules.pop(s, None)
+        real = importlib.import_module(name)
+        exec_mod = sys.modules.get("tests.test_executor")
+        if exec_mod is not None:
+            if name == "numpy" and getattr(getattr(exec_mod, "np", None), "_br_lazy_stub", False):
+                exec_mod.np = real
+            elif name == "pandas" and getattr(getattr(exec_mod, "pd", None), "_br_lazy_stub", False):
+                exec_mod.pd = real
+            elif name == "pandas.testing":
+                exec_mod.assert_frame_equal = real.assert_frame_equal
+        return real
+
+    class _LazyModule(types.ModuleType):
+        _br_lazy_stub = True
+
+        def __getattr__(self, attr: str):
+            return getattr(_load_real(self.__name__), attr)
+
+    def _lazy_assert_frame_equal(*args, **kwargs):
+        real_testing = _load_real("pandas.testing")
+        return real_testing.assert_frame_equal(*args, **kwargs)
+
+    np_stub = _LazyModule("numpy")
+    pd_stub = _LazyModule("pandas")
+    pd_testing_stub = _LazyModule("pandas.testing")
+    pd_testing_stub.assert_frame_equal = _lazy_assert_frame_equal
+    pd_stub.testing = pd_testing_stub
+    sys.modules["numpy"] = np_stub
+    sys.modules["pandas"] = pd_stub
+    sys.modules["pandas.testing"] = pd_testing_stub
+
+
 def _patch_pool_references() -> None:
     """Ensure both concurrent.futures and already-imported test modules use _InProcessExecutor."""
     cf.ProcessPoolExecutor = _InProcessExecutor
@@ -375,27 +441,24 @@ def _run_child_verification(
 
             signal.signal(signal.SIGALRM, _alarm_handler)
 
-            # Execute cheapest tests first for fastest fail-fast stopping.
-            ordered = sorted(task.chosen, key=lambda n: (ms_by_number[n], id_by_number[n]))
             failed: set[int] = set()
             passed: set[int] = set()
-            unverified: set[int] = set(ordered)
             loaded_classes: dict[tuple[str, str], type] = {}
             setup_done: set[type] = set()
             executor_patched = "tests/test_executor.py" in task.selection.patched_files
+            needs_real_tpc = any(
+                id_by_number[n] in TPC_EXECUTOR_TESTS
+                and not (task.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
+                for n in task.chosen
+            )
+            if not executor_patched and not needs_real_tpc:
+                _install_lazy_data_libs()
 
-            for num in ordered:
+            def _run_unittest(num: int) -> bool:
                 tid = id_by_number[num]
-                if tid in SUBPROCESS_TESTS:
-                    continue
-                if failed and not _should_continue_after_failure(failed, unverified, ms_by_number):
-                    break
-
-                unverified.discard(num)
                 parts = tid.split("::")
                 if len(parts) != 3:
-                    failed.add(num)
-                    continue
+                    return False
                 file_path, cls_name, meth_name = parts
                 mod_name = file_path[:-3].replace("/", ".")
                 key = (mod_name, cls_name)
@@ -421,11 +484,92 @@ def _run_child_verification(
                     ok = False
                 finally:
                     signal.alarm(0)
+                return ok
 
-                if ok:
-                    passed.add(num)
-                else:
-                    failed.add(num)
+            if task.tpc_mode:
+                # TPC execution order: cheap fail-fast probe -> cached TPC -> cost-gated tail.
+                other_ordered = sorted(
+                    (n for n in task.chosen if id_by_number[n] not in TPC_SUITE_BY_TEST_ID),
+                    key=lambda n: (ms_by_number[n], id_by_number[n]),
+                )
+                tpc_ordered = sorted(
+                    (n for n in task.chosen if id_by_number[n] in TPC_SUITE_BY_TEST_ID),
+                    key=lambda n: (ms_by_number[n], id_by_number[n]),
+                )
+                probe_tests: list[int] = []
+                tail_tests: list[int] = []
+                probe_ms = 0
+                for num in other_ordered:
+                    dur = ms_by_number[num]
+                    if (
+                        id_by_number[num] not in SUBPROCESS_TESTS
+                        and dur <= MAX_SINGLE_TEST_MS
+                        and probe_ms + dur <= TPC_PROBE_BUDGET_MS
+                    ):
+                        probe_tests.append(num)
+                        probe_ms += dur
+                    else:
+                        tail_tests.append(num)
+
+                # Step A: fail-fast probe catches real bugs in ~0.05-0.3s before spending TPC CPU.
+                for num in probe_tests:
+                    if _run_unittest(num):
+                        passed.add(num)
+                    else:
+                        failed.add(num)
+                        break
+
+                # Step B: verify TPC test(s) via exact cached two-stage verifier.
+                if not failed:
+                    for num in tpc_ordered:
+                        tid = id_by_number[num]
+                        ok = False
+                        signal.alarm(60)
+                        try:
+                            ok = verify_tpc_test(TPC_SUITE_BY_TEST_ID[tid], task.tpc_mode)
+                        except BaseException:
+                            ok = False
+                        finally:
+                            signal.alarm(0)
+                        if ok:
+                            passed.add(num)
+                        else:
+                            failed.add(num)
+                            break
+
+                # Step C: only verify remaining non-TPC tail if dropping it beats its CPU cost.
+                if not failed and tail_tests:
+                    tail_durs = [ms_by_number[n] for n in tail_tests]
+                    tail_sim, _ = split_with_cost([(ms_by_number[n], n) for n in tail_tests])
+                    if (
+                        max(tail_durs) <= MAX_SINGLE_TEST_MS
+                        and sum(tail_durs) <= MAX_COMMIT_VERIFY_MS
+                        and tail_sim - sum(tail_durs) >= MIN_GAIN_MS
+                    ):
+                        unverified = set(tail_tests)
+                        for num in tail_tests:
+                            if id_by_number[num] in SUBPROCESS_TESTS:
+                                continue
+                            if failed and not _should_continue_after_failure(failed, unverified, ms_by_number):
+                                break
+                            unverified.discard(num)
+                            if _run_unittest(num):
+                                passed.add(num)
+                            else:
+                                failed.add(num)
+            else:
+                ordered = sorted(task.chosen, key=lambda n: (ms_by_number[n], id_by_number[n]))
+                unverified: set[int] = set(ordered)
+                for num in ordered:
+                    if id_by_number[num] in SUBPROCESS_TESTS:
+                        continue
+                    if failed and not _should_continue_after_failure(failed, unverified, ms_by_number):
+                        break
+                    unverified.discard(num)
+                    if _run_unittest(num):
+                        passed.add(num)
+                    else:
+                        failed.add(num)
 
             payload = json.dumps({"passed": sorted(passed), "failed": sorted(failed)}).encode("utf-8")
             os.write(w_fd, payload)
@@ -476,8 +620,9 @@ def _run_child_verification(
     try:
         data = json.loads(raw)
         passed_set = set(data["passed"])
+        mtag = f" tpc={task.tpc_mode}" if task.tpc_mode else ""
         log(
-            f"{task.commit}: p{task.phase} cpu={child_cpu:.3f}s "
+            f"{task.commit}: p{task.phase}{mtag} cpu={child_cpu:.3f}s "
             f"pass={len(passed_set)} fail={len(data['failed'])}/{len(task.chosen)}"
         )
         # Soundness: only drop tests that explicitly passed; retain everything else.
@@ -499,14 +644,8 @@ def plan_verification(
         tids = [id_by_number[n] for n in chosen]
         if any(tid in SUBPROCESS_TESTS for tid in tids):
             continue
-        durations = [ms_by_number[n] for n in chosen]
-        max_ms = max(durations)
-        total_ms = sum(durations)
-        if max_ms > MAX_SINGLE_TEST_MS or total_ms > MAX_COMMIT_VERIFY_MS:
-            continue
-        if sel.fixture_only and total_ms > VERIFY_FIXTURE_MAX_MS:
-            continue
-
+        tpc_nums = [n for n in chosen if id_by_number[n] in TPC_SUITE_BY_TEST_ID]
+        other_nums = [n for n in chosen if id_by_number[n] not in TPC_SUITE_BY_TEST_ID]
         static_cost_ms, _ = split_with_cost([(ms_by_number[n], n) for n in chosen])
         can_phase2 = (
             ENABLE_HOTPATCH
@@ -515,9 +654,54 @@ def plan_verification(
         )
         phase = 2 if can_phase2 else 1
         overhead_ms = 30 if phase == 2 else 300
-        est_cpu_ms = overhead_ms + total_ms
-        if static_cost_ms - est_cpu_ms < MIN_GAIN_MS:
-            continue
+
+        tpc_mode: str | None = None
+        if tpc_nums and ENABLE_TPC_FAST:
+            tpc_mode = select_tpc_mode(sel)
+            if tpc_mode is None:
+                continue
+            if not ENABLE_TPC_FAST_B and tpc_mode != "fast_a":
+                continue
+            other_durs = [ms_by_number[n] for n in other_nums]
+            sc_other, _ = (
+                split_with_cost([(ms_by_number[n], n) for n in other_nums])
+                if other_nums
+                else (0, [])
+            )
+            tpc_cpu_ms = sum(
+                TPC_EST_CPU_MS[(TPC_SUITE_BY_TEST_ID[id_by_number[n]], tpc_mode)]
+                for n in tpc_nums
+            )
+            verify_tail = (
+                not other_nums
+                or (
+                    max(other_durs) <= MAX_SINGLE_TEST_MS
+                    and sum(other_durs) <= MAX_COMMIT_VERIFY_MS
+                    and sc_other - sum(other_durs) >= MIN_GAIN_MS
+                )
+            )
+            if verify_tail:
+                est_cpu_ms = overhead_ms + sum(other_durs) + tpc_cpu_ms
+                expected_gain_ms = static_cost_ms - est_cpu_ms
+            else:
+                probe_ms = min(sum(other_durs), TPC_PROBE_BUDGET_MS)
+                est_cpu_ms = overhead_ms + probe_ms + tpc_cpu_ms
+                expected_gain_ms = (static_cost_ms - sc_other) - est_cpu_ms
+            if expected_gain_ms < TPC_MIN_GAIN_MS:
+                continue
+        else:
+            durations = [ms_by_number[n] for n in chosen]
+            max_ms = max(durations)
+            total_ms = sum(durations)
+            if max_ms > MAX_SINGLE_TEST_MS or total_ms > MAX_COMMIT_VERIFY_MS:
+                continue
+            if sel.fixture_only and total_ms > VERIFY_FIXTURE_MAX_MS:
+                continue
+            est_cpu_ms = overhead_ms + total_ms
+            expected_gain_ms = static_cost_ms - est_cpu_ms
+            if expected_gain_ms < MIN_GAIN_MS:
+                continue
+
         candidates.append(
             VerifyTask(
                 commit=commit,
@@ -526,12 +710,14 @@ def plan_verification(
                 phase=phase,
                 static_cost_ms=static_cost_ms,
                 est_cpu_ms=est_cpu_ms,
+                expected_gain_ms=expected_gain_ms,
+                tpc_mode=tpc_mode,
             )
         )
 
     # Deterministically prioritize highest ROI (net savings / CPU) within total budget.
     candidates.sort(
-        key=lambda t: (-(t.static_cost_ms - t.est_cpu_ms) / max(t.est_cpu_ms, 1), t.commit)
+        key=lambda t: (-t.expected_gain_ms / max(t.est_cpu_ms, 1), t.commit)
     )
     budget_used = 0
     phase1: list[VerifyTask] = []
@@ -587,6 +773,14 @@ def _prewarm_for_phase2(
         if count >= 2:
             needed_mods.add(mod)
 
+    if "tests.test_executor" in needed_mods and not any(
+        id_by_number[n] in TPC_EXECUTOR_TESTS
+        and not (t.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
+        for t in phase2_tasks
+        for n in t.chosen
+    ):
+        _install_lazy_data_libs()
+
     for mod_name in sorted(needed_mods):
         if mod_name not in sys.modules:
             try:
@@ -609,11 +803,18 @@ def verify_batches(
 
     # Pre-import heavy third-party C extensions once in parent BEFORE Phase 1 forks
     # (independent of sqlglot, shared via COW across both Phase 1 and Phase 2).
+    # Only import numpy/pandas eagerly when a task actually runs TPC-H/TPC-DS tests.
     all_tasks = phase1 + phase2
     needs_opt = any(id_by_number[n].startswith("tests/test_optimizer.py::") for t in all_tasks for n in t.chosen)
     needs_exec = any(id_by_number[n].startswith("tests/test_executor.py::") for t in all_tasks for n in t.chosen)
+    needs_tpc = any(
+        id_by_number[n] in TPC_EXECUTOR_TESTS
+        and not (t.tpc_mode and id_by_number[n] in TPC_SUITE_BY_TEST_ID)
+        for t in all_tasks
+        for n in t.chosen
+    )
     if needs_opt or needs_exec:
-        for pkg in ("duckdb", "numpy", "pandas") if needs_exec else ("duckdb",):
+        for pkg in ("duckdb", "numpy", "pandas") if needs_tpc else ("duckdb",):
             try:
                 importlib.import_module(pkg)
             except Exception:

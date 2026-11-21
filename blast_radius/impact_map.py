@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import marshal
 from pathlib import Path
 
 
@@ -11,10 +12,16 @@ class ImpactMap:
     """In-memory query interface over the precomputed pinned-sqlglot impact map."""
 
     def __init__(self, path: Path):
-        with gzip.open(path, "rt") as handle:
-            raw = json.load(handle)
+        marshal_path = path.parent / "impact.marshal"
+        if marshal_path.is_file():
+            with open(marshal_path, "rb") as handle:
+                raw = marshal.load(handle)
+        else:
+            with gzip.open(path, "rt") as handle:
+                raw = json.load(handle)
         self.test_ids: list[str] = raw["tests"]
-        self._sets: list[str] = raw["sets"]
+        self._sets = raw["sets"]
+        self._sets_binary: bool = bool(raw.get("sets_binary", False))
         self._decoded: dict[int, int] = {}
         self.lines: dict[str, dict[str, int]] = raw["lines"]
         self.import_lines = {f: set(v) for f, v in raw["import_lines"].items()}
@@ -56,7 +63,9 @@ class ImpactMap:
     def mask(self, set_index: int) -> int:
         value = self._decoded.get(set_index)
         if value is None:
-            value = self._decoded[set_index] = int(self._sets[set_index], 16)
+            entry = self._sets[set_index]
+            value = int.from_bytes(entry, "little") if self._sets_binary else int(entry, 16)
+            self._decoded[set_index] = value
         return value
 
     def line(self, file: str, lineno: int) -> int:

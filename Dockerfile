@@ -13,9 +13,16 @@ RUN mkdir -p /app/sqlglot-src \
     && rm /tmp/sqlglot.tar.gz \
     && python -m compileall -q /app/sqlglot-src
 
+# Precompile TPC baseline before copying the rest of blast_radius so local rebuilds stay cached.
+COPY blast_radius/__init__.py blast_radius/precompile_tpc.py /app/blast_radius/
+RUN mkdir -p /app/map \
+    && PYTHONPATH=/app python -m blast_radius.precompile_tpc
+
 COPY blast_radius/ /app/blast_radius/
 COPY map/ /app/map/
-RUN python -m compileall -q /app/blast_radius && chmod -R a+rX /app
+RUN python -m compileall -q /app/blast_radius \
+    && PYTHONPATH=/app python -m blast_radius.precompile \
+    && chmod -R a+rX /app
 
 ENV SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app

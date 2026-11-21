@@ -31,6 +31,7 @@ class Scopes:
     """Where each line of a module sits: functions, classes, statements, class assigns."""
 
     def __init__(self, tree: ast.Module):
+        self.tree = tree
         self.functions: list[tuple[int, int, int, str, ast.AST]] = []
         self.lambdas: list[tuple[int, int]] = []
         self.classes: list[tuple[int, int, str]] = []
@@ -38,6 +39,13 @@ class Scopes:
         self.statements: list[tuple[int, int, ast.stmt]] = []
         self.class_assigns: dict[tuple[str, str], ast.stmt] = {}
         self.docstrings: set[int] = set()
+        self.type_checking_ranges: list[tuple[int, int]] = []
+        self.has_future_annotations = any(
+            isinstance(s, ast.ImportFrom)
+            and s.module == "__future__"
+            and any(a.name == "annotations" for a in s.names)
+            for s in tree.body
+        )
         self._walk(tree, "")
 
     def _walk(self, node: ast.AST, prefix: str) -> None:
@@ -47,6 +55,8 @@ class Scopes:
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.stmt):
                 self.statements.append((child.lineno, child.end_lineno, child))
+            if isinstance(child, ast.If) and is_type_checking_guard(child) and child.body:
+                self.type_checking_ranges.append((child.body[0].lineno, child.body[-1].end_lineno))
             if isinstance(child, FUNCTION_NODES):
                 qualname = prefix + child.name
                 head = min([child.lineno] + [d.lineno for d in child.decorator_list])
@@ -109,6 +119,106 @@ class Scopes:
             if cqual == cls_qualname and stmt.lineno <= lineno <= stmt.end_lineno:
                 return cls_qualname, attr, stmt
         return None
+
+    def in_type_checking(self, lineno: int) -> bool:
+        return any(s <= lineno <= e for s, e in self.type_checking_ranges)
+
+
+def is_type_checking_guard(node: ast.If) -> bool:
+    """True for `if TYPE_CHECKING:` or `if t.TYPE_CHECKING:` / `if typing.TYPE_CHECKING:`."""
+    test = node.test
+    if isinstance(test, ast.Name) and test.id == "TYPE_CHECKING":
+        return True
+    if isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING":
+        return True
+    return False
+
+
+def canon_ast(node: ast.AST | list | None, ignore_annotations: bool = False):
+    """Canonical structural tuple of an AST node for semantics-preserving equality checks.
+
+    Ignores formatting, quote style, parens, comments, `if TYPE_CHECKING:` bodies,
+    `return None` vs bare `return`, and (when `from __future__ import annotations`
+    is active and safe) type annotations. Tags constants with their exact Python type
+    so `1` never compares equal to `True`.
+    """
+    if node is None:
+        return None
+    if isinstance(node, list):
+        out = []
+        for item in node:
+            if isinstance(item, ast.If) and is_type_checking_guard(item):
+                if item.orelse:
+                    out.extend(canon_ast(item.orelse, ignore_annotations))
+                continue
+            out.append(canon_ast(item, ignore_annotations))
+        return tuple(out)
+    if not isinstance(node, ast.AST):
+        return (type(node).__name__, node)
+    if isinstance(node, ast.Constant):
+        return ("Constant", type(node.value).__name__, node.value)
+    if isinstance(node, ast.Return):
+        val = node.value
+        if isinstance(val, ast.Constant) and val.value is None:
+            return ("Return", None)
+        return ("Return", canon_ast(val, ignore_annotations))
+    if ignore_annotations:
+        if isinstance(node, ast.arg):
+            return ("arg", node.arg)
+        if isinstance(node, ast.AnnAssign) and node.value is not None:
+            return ("Assign", (canon_ast(node.target, True),), canon_ast(node.value, True))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return (
+                type(node).__name__,
+                node.name,
+                canon_ast(node.args, True),
+                canon_ast(node.body, True),
+                canon_ast(node.decorator_list, True),
+            )
+    fields = []
+    for name in node._fields:
+        if name == "type_comment":
+            continue
+        if ignore_annotations and isinstance(node, ast.AnnAssign) and name == "annotation":
+            continue
+        fields.append(canon_ast(getattr(node, name), ignore_annotations))
+    return (type(node).__name__, *fields)
+
+
+def same_ast(
+    old_tree: ast.Module,
+    new_tree: ast.Module,
+    old_text: str,
+    new_text: str,
+    ignore_annotations: bool = False,
+    old_lines: set[int] | None = None,
+    new_lines: set[int] | None = None,
+) -> bool:
+    """True when two modules have identical normalized ASTs and identical encoding cookies.
+
+    When changed line sets are provided, only top-level statements intersecting the edit
+    are canonicalized, avoiding full-file AST traversal on multi-thousand-line modules.
+    """
+    if _encoding_cookie(old_text) != _encoding_cookie(new_text):
+        return False
+    if old_lines is not None and new_lines is not None:
+        old_stmts = [
+            s for s in old_tree.body
+            if not (isinstance(s, ast.If) and is_type_checking_guard(s) and not s.orelse)
+        ]
+        new_stmts = [
+            s for s in new_tree.body
+            if not (isinstance(s, ast.If) and is_type_checking_guard(s) and not s.orelse)
+        ]
+        if len(old_stmts) == len(new_stmts):
+            for so, sn in zip(old_stmts, new_stmts):
+                touched = any(so.lineno <= ln <= so.end_lineno for ln in old_lines) or any(
+                    sn.lineno <= ln <= sn.end_lineno for ln in new_lines
+                )
+                if touched and canon_ast(so, ignore_annotations) != canon_ast(sn, ignore_annotations):
+                    return False
+            return True
+    return canon_ast(old_tree, ignore_annotations) == canon_ast(new_tree, ignore_annotations)
 
 
 def _single_assign_target(stmt: ast.stmt) -> str | None:

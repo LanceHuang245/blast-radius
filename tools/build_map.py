@@ -260,16 +260,19 @@ def all_runtime_imports(node: ast.AST):
 
 
 def static_class_refs(trees: dict[str, ast.Module], lines: dict[str, dict[int, int]]) -> dict[str, int]:
-    """Map each top-level sqlglot class to tests covering lines that reference its name."""
-    # Map short class name -> list of (class_key, def_file, start_line, end_line).
-    skip_names = {"Tokenizer", "Parser", "Generator", "JSONPathTokenizer", "Dialect"}
+    """Map each Expression class to tests covering runtime `exp.<Cls>.<member>` accesses.
+
+    Scoped strictly to attribute accesses on `exp.<Cls>` (excluding type annotations and
+    `isinstance` checks) so unrelated names like `t.Any`, `TokenType.LT`, or `exp.Table`
+    for `executor.table.Table` never inflate blast radius.
+    """
     defs_by_name: dict[str, list[tuple[str, str, int, int]]] = defaultdict(list)
     for rel, tree in trees.items():
-        if not rel.startswith("sqlglot/"):
+        if not rel.startswith("sqlglot/expressions/"):
             continue
         mod = module_name(rel)
         for node in tree.body:
-            if isinstance(node, ast.ClassDef) and not node.name.startswith("_") and node.name not in skip_names:
+            if isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
                 defs_by_name[node.name].append((f"{mod}:{node.name}", rel, node.lineno, node.end_lineno))
 
     refs: dict[str, int] = defaultdict(int)
@@ -277,26 +280,64 @@ def static_class_refs(trees: dict[str, ast.Module], lines: dict[str, dict[int, i
         per_file = lines.get(rel)
         if not per_file:
             continue
-        # Walk AST skipping import statements so mere imports don't inflate class refs.
-        stack: list[ast.AST] = [tree]
-        while stack:
-            cur = stack.pop()
-            if isinstance(cur, (ast.Import, ast.ImportFrom)):
-                continue
-            name = None
-            if isinstance(cur, ast.Name) and isinstance(cur.ctx, ast.Load):
-                name = cur.id
-            elif isinstance(cur, ast.Attribute) and isinstance(cur.ctx, ast.Load):
-                name = cur.attr
-            if name and name in defs_by_name:
-                ln = getattr(cur, "lineno", None)
-                mask = per_file.get(ln, 0) if ln is not None else 0
-                if mask:
-                    for ckey, def_rel, start, end in defs_by_name[name]:
-                        if rel == def_rel and start <= ln <= end:
-                            continue
-                        refs[ckey] |= mask
-            stack.extend(ast.iter_child_nodes(cur))
+
+        imported_exp: dict[str, str] = {}
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and (
+                (node.module and (node.module == "sqlglot.expressions" or node.module.startswith("sqlglot.expressions.")))
+                or (rel.startswith("sqlglot/expressions/") and node.level >= 1)
+            ):
+                for al in node.names:
+                    if al.name in defs_by_name:
+                        imported_exp[al.asname or al.name] = al.name
+        if rel.startswith("sqlglot/expressions/"):
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and node.name in defs_by_name:
+                    imported_exp[node.name] = node.name
+
+        def record(cls_name: str, ln: int | None) -> None:
+            mask = per_file.get(ln, 0) if ln is not None else 0
+            if not mask:
+                return
+            for ckey, def_rel, start, end in defs_by_name[cls_name]:
+                if rel == def_rel and start <= ln <= end:
+                    continue
+                refs[ckey] |= mask
+
+        def walk(node: ast.AST) -> None:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                return
+            # Match `exp.<Cls>.<member>` or directly imported `<Cls>.<member>`.
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                if (
+                    isinstance(node.value, ast.Attribute)
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id == "exp"
+                    and node.value.attr in defs_by_name
+                ):
+                    record(node.value.attr, getattr(node, "lineno", None))
+                elif isinstance(node.value, ast.Name) and node.value.id in imported_exp:
+                    record(imported_exp[node.value.id], getattr(node, "lineno", None))
+            # Skip type annotations so `exp.DataType.Type` hints are not treated as runtime reads.
+            if isinstance(node, ast.arg):
+                return
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for dec in node.decorator_list:
+                    walk(dec)
+                for d in node.args.defaults + [x for x in node.args.kw_defaults if x is not None]:
+                    walk(d)
+                for stmt in node.body:
+                    walk(stmt)
+                return
+            if isinstance(node, ast.AnnAssign):
+                walk(node.target)
+                if node.value is not None:
+                    walk(node.value)
+                return
+            for ch in ast.iter_child_nodes(node):
+                walk(ch)
+
+        walk(tree)
     return refs
 
 

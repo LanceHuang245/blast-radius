@@ -13,9 +13,12 @@ from blast_radius.scopes import (
     Scopes,
     _extract_dict_entries,
     _function_binding_shape,
+    _is_docstring,
+    canon_ast,
     comment_lines_only,
     header_end,
     indent,
+    same_ast,
     same_code,
 )
 
@@ -38,6 +41,50 @@ class Selection:
 
 def _decorator_name(node: ast.expr) -> str | None:
     return node.id if isinstance(node, ast.Name) else None
+
+
+def _matching_compound_subblocks(
+    so: ast.stmt,
+    sn: ast.stmt,
+    ignore_ann: bool,
+) -> list[tuple[list[ast.stmt], list[ast.stmt]]] | None:
+    """If two same-type compound statements share an identical header, return their paired sub-blocks."""
+    if isinstance(so, (ast.If, ast.While)):
+        if canon_ast(so.test, ignore_ann) == canon_ast(sn.test, ignore_ann):
+            return [(so.body, sn.body), (so.orelse, sn.orelse)]
+    elif isinstance(so, (ast.For, ast.AsyncFor)):
+        if canon_ast(so.target, ignore_ann) == canon_ast(sn.target, ignore_ann) and canon_ast(
+            so.iter, ignore_ann
+        ) == canon_ast(sn.iter, ignore_ann):
+            return [(so.body, sn.body), (so.orelse, sn.orelse)]
+    elif isinstance(so, (ast.With, ast.AsyncWith)):
+        if canon_ast(so.items, ignore_ann) == canon_ast(sn.items, ignore_ann):
+            return [(so.body, sn.body)]
+    elif isinstance(so, ast.Try):
+        if len(so.handlers) == len(sn.handlers) and all(
+            canon_ast(ho.type, ignore_ann) == canon_ast(hn.type, ignore_ann) and ho.name == hn.name
+            for ho, hn in zip(so.handlers, sn.handlers)
+        ):
+            pairs = [(so.body, sn.body), (so.orelse, sn.orelse), (so.finalbody, sn.finalbody)]
+            pairs.extend((ho.body, hn.body) for ho, hn in zip(so.handlers, sn.handlers))
+            return pairs
+    return None
+
+
+def _same_compound_bodies(so: ast.stmt, sn: ast.stmt, ignore_ann: bool) -> bool:
+    """True when all sub-block bodies of two same-type compound statements are canonically identical."""
+    for field in ("body", "orelse", "finalbody"):
+        bo = getattr(so, field, None)
+        bn = getattr(sn, field, None)
+        if bo is not None or bn is not None:
+            if canon_ast(bo, ignore_ann) != canon_ast(bn, ignore_ann):
+                return False
+    ho = getattr(so, "handlers", None)
+    hn = getattr(sn, "handlers", None)
+    if ho is not None or hn is not None:
+        if canon_ast(ho, ignore_ann) != canon_ast(hn, ignore_ann):
+            return False
+    return True
 
 
 def _extract_attr_hot_targets(
@@ -288,10 +335,31 @@ class Selector:
             raise Everything(f"{path} no longer compiles")
         new_scopes = Scopes(new_tree)
 
+        # Normalized AST equivalence catches quote/paren/wrapping refactors, TYPE_CHECKING-only
+        # edits, and pure type-annotation edits when `from __future__ import annotations` holds.
+        blocks = list(change_blocks(hunks))
+        changed_old_lines = {ln for rem, _ in blocks for ln, _ in rem}
+        changed_new_lines = {ln for _, add in blocks for ln, _, _ in add}
+        ignore_ann = (
+            old_scopes.has_future_annotations
+            and new_scopes.has_future_annotations
+            and self.impact.file_readers(path) == 0
+        )
+        if same_ast(
+            old_scopes.tree,
+            new_tree,
+            old_text,
+            new_text,
+            ignore_annotations=ignore_ann,
+            old_lines=changed_old_lines,
+            new_lines=changed_new_lines,
+        ):
+            return 0, True, new_text, [], []
+
         module = module_name(path)
         mask = 0
-        for removed, added in change_blocks(hunks):
-            mask |= self.select_block(path, module, old_scopes, new_scopes, removed, added)
+        for removed, added in blocks:
+            mask |= self.select_block(path, module, old_scopes, new_scopes, removed, added, ignore_ann)
 
         targets: list[tuple[str, str]] | None = None
         attr_targets: list[tuple[str, str, str, object]] | None = None
@@ -301,7 +369,23 @@ class Selector:
                 attr_targets = _extract_attr_hot_targets(path, module, old_scopes, new_scopes, hunks, self.impact)
         return mask, False, new_text, targets, attr_targets
 
-    def select_block(self, path, module, old_scopes, new_scopes, removed, added) -> int:
+    def select_block(
+        self,
+        path,
+        module,
+        old_scopes: Scopes,
+        new_scopes: Scopes,
+        removed,
+        added,
+        ignore_ann: bool = False,
+    ) -> int:
+        # Edits strictly inside `if TYPE_CHECKING:` bodies never execute at runtime.
+        if (removed or added) and (
+            all(old_scopes.in_type_checking(n) for n, _ in removed)
+            and all(new_scopes.in_type_checking(n) for n, _, _ in added)
+        ):
+            return 0
+
         # Try fine-grained class dict-key or class attribute tracking first.
         attr_mask = self.class_attr_level(path, module, old_scopes, new_scopes, removed, added)
         if attr_mask is not None:
@@ -312,6 +396,11 @@ class Selector:
             mask = self.statement_level(path, old_scopes, new_scopes, removed, added)
             if mask is not None:
                 return mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
+
+        # Multi-line edits or insertions confined to a single function body: AST statement diff.
+        ast_mask = self.ast_statement_level(path, old_scopes, new_scopes, removed, added, ignore_ann)
+        if ast_mask is not None:
+            return ast_mask | self._test_file_own_mask(path, old_scopes, new_scopes, removed, added)
 
         mask = 0
         for lineno, _ in removed:
@@ -463,6 +552,121 @@ class Selector:
                     return None  # else:/finally: lines and the like
                 stop = last
             mask |= impact.span(path, start, stop)
+        return mask
+
+    def ast_statement_level(
+        self,
+        path: str,
+        old_scopes: Scopes,
+        new_scopes: Scopes,
+        removed,
+        added,
+        ignore_ann: bool,
+    ) -> int | None:
+        """Map multi-line edits or insertions inside one function body via recursive AST statement diff."""
+        if not removed and not added:
+            return None
+        qualname = None
+        old_fn = None
+        new_fn = None
+        for old_no, _ in removed:
+            fn = old_scopes.function_at(old_no)
+            if fn is None or old_no < fn[0]:
+                return None
+            if qualname is None:
+                qualname, old_fn = fn[3], fn
+            elif fn[3] != qualname:
+                return None
+        for new_no, _anchor, _ in added:
+            fn = new_scopes.function_at(new_no)
+            if fn is None or new_no < fn[0]:
+                return None
+            if qualname is None:
+                qualname, new_fn = fn[3], fn
+            elif fn[3] != qualname:
+                return None
+            else:
+                new_fn = fn
+        if qualname is None:
+            return None
+        if len(old_scopes.by_qualname.get(qualname, ())) != 1 or len(new_scopes.by_qualname.get(qualname, ())) != 1:
+            return None
+        if old_fn is None:
+            old_fn = next((f for f in old_scopes.functions if f[3] == qualname), None)
+        if new_fn is None:
+            new_fn = next((f for f in new_scopes.functions if f[3] == qualname), None)
+        if old_fn is None or new_fn is None:
+            return None
+        body_start, end, _head, _q, old_node = old_fn
+        new_node = new_fn[4]
+        if self.runs_at_import(path, body_start, end):
+            return None
+        if _function_binding_shape(old_node) != _function_binding_shape(new_node):
+            return None
+        return self._diff_stmt_lists(path, old_node.body, new_node.body, ignore_ann)
+
+    def _diff_stmt_lists(
+        self,
+        path: str,
+        old_stmts: list[ast.stmt],
+        new_stmts: list[ast.stmt],
+        ignore_ann: bool,
+    ) -> int | None:
+        """Return coverage mask for the minimal changed statements/sub-blocks between two statement lists."""
+        impact = self.impact
+        old_c = [canon_ast(s, ignore_ann) for s in old_stmts]
+        new_c = [canon_ast(s, ignore_ann) for s in new_stmts]
+
+        prefix = 0
+        limit = min(len(old_c), len(new_c))
+        while prefix < limit and old_c[prefix] == new_c[prefix]:
+            prefix += 1
+
+        suffix = 0
+        rem_old = len(old_c) - prefix
+        rem_new = len(new_c) - prefix
+        while suffix < min(rem_old, rem_new) and old_c[len(old_c) - 1 - suffix] == new_c[len(new_c) - 1 - suffix]:
+            suffix += 1
+
+        mid_old = old_stmts[prefix : len(old_stmts) - suffix]
+        mid_new = new_stmts[prefix : len(new_stmts) - suffix]
+
+        if not mid_old and not mid_new:
+            return 0
+
+        # Pure insertion into this block: any test reaching the insertion point must pass through
+        # an adjacent dominating non-docstring sibling statement in the same block.
+        if not mid_old:
+            sib = next((s for s in reversed(old_stmts[:prefix]) if not _is_docstring(s)), None)
+            if sib is None:
+                sib = next((s for s in old_stmts[prefix:] if not _is_docstring(s)), None)
+            if sib is None:
+                return None
+            stop = header_end(sib) if isinstance(sib, COMPOUND_NODES) else sib.end_lineno
+            return impact.span(path, sib.lineno, stop)
+
+        # Single compound statement edited in place: recurse into sub-blocks if its header is unchanged.
+        if len(mid_old) == 1 and len(mid_new) == 1 and type(mid_old[0]) is type(mid_new[0]):
+            so, sn = mid_old[0], mid_new[0]
+            sub_pairs = _matching_compound_subblocks(so, sn, ignore_ann)
+            if sub_pairs is not None:
+                mask = 0
+                for bo, bn in sub_pairs:
+                    sub_mask = self._diff_stmt_lists(path, bo, bn, ignore_ann)
+                    if sub_mask is None:
+                        return impact.span(path, so.lineno, so.end_lineno)
+                    mask |= sub_mask
+                return mask
+            # Only the compound header changed while all sub-blocks are identical.
+            if isinstance(so, COMPOUND_NODES) and _same_compound_bodies(so, sn, ignore_ann):
+                return impact.span(path, so.lineno, header_end(so))
+
+        mask = 0
+        for s in mid_old:
+            if _is_docstring(s):
+                mask |= self.docs_mask
+            else:
+                mask |= impact.span(path, s.lineno, s.end_lineno)
         return mask
 
     def runs_at_import(self, path: str, first: int, last: int) -> bool:
