@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import os
 import pickle
+import signal
 import sys
 import time
 
@@ -103,9 +104,10 @@ TPC_EST_CPU_MS = {
 # fast_a re-executes queries whose optimized plan changed; cheapest queries run first so broken
 # commits fail fast. Primary budget uses deterministic precompiled s2b_query_ms (identical across
 # all 3 scorer runs); TPC_REEXEC_BUDGET_S is an emergency hard CPU ceiling.
-TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "35"))
-TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "9500"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "14.0"))
+TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "99"))
+TPC_REEXEC_INLINE = int(os.environ.get("BR_TPC_REEXEC_INLINE", "6"))
+TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "10500"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "16.0"))
 TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "35"))
 TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "8.0"))
 
@@ -504,7 +506,7 @@ def _same_duckdb_results(suite_name: str, pairs: list[tuple[str, str]]) -> bool:
     when the patched and pinned SQL return the same columns, types and rows on the test's
     own views, the expected side of every comparison is unchanged.
     """
-    if len(pairs) > TPC_REEXEC_MAX_QUERIES:
+    if len(pairs) > TPC_DUCK_MAX_QUERIES:
         return False
     import duckdb
     from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, TPCH_SCHEMA
@@ -520,7 +522,7 @@ def _same_duckdb_results(suite_name: str, pairs: list[tuple[str, str]]) -> bool:
                 f"'{FIXTURES_DIR}/optimizer/{folder}/{table}.csv.gz', delim='|', header=True, columns={columns})"
             )
         for new_sql, old_sql in pairs:
-            if time.process_time() - t0 > TPC_REEXEC_BUDGET_S:
+            if time.process_time() - t0 > TPC_DUCK_BUDGET_S:
                 return False
             new = conn.execute(new_sql)
             new_desc, new_rows = [d[:2] for d in new.description], new.fetchall()
@@ -530,6 +532,14 @@ def _same_duckdb_results(suite_name: str, pairs: list[tuple[str, str]]) -> bool:
         return True
     finally:
         conn.close()
+
+
+class _ReexecTooSlow(BaseException):
+    pass
+
+
+def _reexec_too_slow(_signum, _frame):
+    raise _ReexecTooSlow()
 
 
 def _why(msg: str) -> None:
@@ -736,10 +746,42 @@ def verify_tpc_test(
 
         reexec_est_ms = 0
 
+        deferred: list[tuple[int, str, object, object, int]] = []
+        inline_ok = 0
+
+        def _run_changed_query(index: int, sql: str, opt_expr, plan, q_est: int) -> bool:
+            nonlocal reexec_cpu
+            t0 = time.process_time()
+            # A broken commit can make the changed plan hang or crawl; the pinned estimate bounds a
+            # healthy run, so cap user CPU at a few multiples of it and call a slower run changed.
+            limit_s = max(2.0, q_est * 6 / 1000)
+            prev_handler = signal.signal(signal.SIGVTALRM, _reexec_too_slow)
+            signal.setitimer(signal.ITIMER_VIRTUAL, limit_s)
+            try:
+                ok = same_rows_as_pinned(index, sql, opt_expr, plan=plan)
+            except _ReexecTooSlow:
+                _why(f"{suite_name} q{index}: reexec exceeded {limit_s:.1f}s")
+                ok = False
+            finally:
+                signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+                signal.signal(signal.SIGVTALRM, prev_handler)
+            reexec_cpu += time.process_time() - t0
+            if not ok:
+                _why(f"{suite_name} q{index}: rows differ")
+            return ok
+
         def _check_changed_query(index: int, sql: str, opt_expr=None, plan=None) -> bool:
-            nonlocal reexec_count, reexec_cpu, reexec_est_ms
+            nonlocal reexec_count, reexec_est_ms, inline_ok
             reexec_count += 1
             q_est = q_cost_ms[index] if (q_cost_ms and index < len(q_cost_ms)) else 500
+            if plan is None:
+                plan = Plan(opt_expr) if opt_expr is not None else None
+            if inline_ok >= TPC_REEXEC_INLINE and plan is not None:
+                # The cheapest changed plans all kept their rows: the commit is likely an equivalent
+                # rewrite, so collect the rest and run them only if the whole bill fits the budget.
+                deferred.append((index, sql, opt_expr, plan, q_est))
+                reexec_est_ms += q_est
+                return True
             if (
                 reexec_count > TPC_REEXEC_MAX_QUERIES
                 or reexec_est_ms + q_est > TPC_REEXEC_EST_BUDGET_MS
@@ -748,11 +790,9 @@ def verify_tpc_test(
                 _why(f"{suite_name}: reexec limit ({reexec_count} queries, est={reexec_est_ms}ms, {reexec_cpu:.2f}s)")
                 return False
             reexec_est_ms += q_est
-            t0 = time.process_time()
-            ok = same_rows_as_pinned(index, sql, opt_expr, plan=plan)
-            reexec_cpu += time.process_time() - t0
-            if not ok:
-                _why(f"{suite_name} q{index}: rows differ")
+            ok = _run_changed_query(index, sql, opt_expr, plan, q_est)
+            if ok:
+                inline_ok += 1
             return ok
 
         # Reduced signatures ignore meta keys no executor-side code names; only sound when none of
@@ -907,6 +947,16 @@ def verify_tpc_test(
                     if not _same_plan_or_rows(index, q, opt_expr, live=True):
                         return False
 
+            if deferred:
+                if reexec_est_ms > TPC_REEXEC_EST_BUDGET_MS or reexec_cpu > TPC_REEXEC_BUDGET_S:
+                    _why(f"{suite_name}: reexec limit ({reexec_count} queries, est={reexec_est_ms}ms, deferred)")
+                    return False
+                for index, sql, opt_expr, plan, q_est in deferred:
+                    if reexec_cpu > TPC_REEXEC_BUDGET_S:
+                        _why(f"{suite_name}: reexec budget ({reexec_cpu:.2f}s)")
+                        return False
+                    if not _run_changed_query(index, sql, opt_expr, plan, q_est):
+                        return False
             _why(f"{suite_name}: pass ({reexec_count} reexec, {duck_count} duck changed)")
             return True
         finally:
