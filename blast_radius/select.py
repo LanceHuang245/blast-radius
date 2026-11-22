@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import ast
 import marshal
-from dataclasses import dataclass, field
-
 import os
+import tomllib
+from dataclasses import dataclass, field
 
 from blast_radius import APP, SOURCE, Everything, log
 from blast_radius.impact_map import ImpactMap, module_name
@@ -54,6 +54,10 @@ class Selection:
     edited_spans: list[tuple[str, int, int]] | None = None
     # Source spans (head_lineno, end_lineno, has_future_annotations) for single-function hot-patch compile.
     hot_patch_spans: dict[tuple[str, str], tuple[int, int, bool]] | None = None
+    # Bitmask of tests pulled in by files outside sqlglot/, so case filtering never narrows them.
+    non_sqlglot_mask: int = 0
+    # Relative fixture path (e.g. "optimizer/simplify.sql") -> changed 0-based pair indices (<=8 pairs).
+    fixture_changed_pairs: dict[str, set[int]] | None = None
 
 
 def _decorator_name(node: ast.expr) -> str | None:
@@ -333,6 +337,7 @@ class Selector:
         self._spans_ok: bool = True
         self._block_used_values: bool = False
         self._owner_checks: set[str] = set()
+        self._fixture_changed_pairs: dict[str, set[int]] = {}
         self._state = marshal.loads(STATE_FILE.read_bytes()) if STATE_FILE.is_file() else None
         self.values = None
         values_file = APP / "map" / "values.bin"
@@ -393,6 +398,7 @@ class Selector:
             if not files:
                 raise Everything("empty patch")
             mask = 0
+            non_sqlglot_mask = 0
             lazy_pp_mask = 0
             all_noop = True
             all_fixture_or_noop = True
@@ -404,6 +410,7 @@ class Selector:
             self._owner_checks = set()
             self._no_verify = False
             self._spans, self._spans_ok = [], True
+            self._fixture_changed_pairs = {}
             self._hot_spans_cur: dict[tuple[str, str], tuple[int, int, bool]] = {}
             for file_patch in files:
                 self._hot_spans_cur = {}
@@ -411,6 +418,8 @@ class Selector:
                     file_patch, patched_files
                 )
                 mask |= file_mask
+                if not (file_patch.new and file_patch.old == file_patch.new and file_patch.new.startswith("sqlglot/")):
+                    non_sqlglot_mask |= file_mask
                 all_noop = all_noop and is_noop
                 all_fixture_or_noop = all_fixture_or_noop and is_fixture_or_comment
                 if f_targets is None and a_targets is None:
@@ -422,8 +431,13 @@ class Selector:
                         hot_spans.update(self._hot_spans_cur)
                     if attr_targets is not None and a_targets:
                         attr_targets.extend(a_targets)
-            # The extra passes below re-select with other settings: keep this pass's spans.
-            spans = list(dict.fromkeys(self._spans)) if self._spans_ok else None
+            # The extra passes below re-select with other settings: keep this pass's spans and pairs.
+            spans = (
+                [s for s in dict.fromkeys(self._spans) if s[0].startswith("sqlglot/")]
+                if self._spans_ok
+                else None
+            )
+            changed_pairs = dict(self._fixture_changed_pairs) if self._fixture_changed_pairs else None
             if self._hit_pp_lazy and mask:
                 self._no_pp_lazy = True
                 try:
@@ -461,6 +475,8 @@ class Selector:
                 coarse_mask=coarse_mask,
                 edited_spans=spans,
                 hot_patch_spans=hot_spans if hot_targets else None,
+                non_sqlglot_mask=non_sqlglot_mask,
+                fixture_changed_pairs=changed_pairs,
             )
         except Everything as reason:
             return Selection(impact.everything, f"everything ({reason})", {}, None, None, False)
@@ -486,7 +502,10 @@ class Selector:
         list[tuple[str, str, str, object]] | None,
     ]:
         impact = self.impact
-        if not (fp.new and fp.new == fp.old and not fp.binary and fp.new.startswith("sqlglot/") and fp.new.endswith(".py")):
+        is_sqlglot = bool(
+            (fp.new and fp.new.startswith("sqlglot/")) or (fp.old and fp.old.startswith("sqlglot/"))
+        )
+        if is_sqlglot and not (fp.new and fp.new == fp.old and not fp.binary and fp.new.endswith(".py")):
             self._spans_ok = False  # only in-place sqlglot .py edits resolve to statement spans
         if fp.binary:
             self._no_verify = True
@@ -538,6 +557,19 @@ class Selector:
                 if old_pairs is not None and new_pairs is not None and old_pairs == new_pairs:
                     return 0, True, True, [], []
             patched_files[path] = new_text
+            if (
+                path.startswith("tests/fixtures/optimizer/")
+                and path not in _LINE_SQL_FIXTURES
+                and path.endswith(".sql")
+                and old_pairs is not None
+                and new_pairs is not None
+                and len(old_pairs) == len(new_pairs)
+                and not self._no_pp_lazy
+                and not self._no_import_check
+            ):
+                changed_idx = {idx for idx, (o, n) in enumerate(zip(old_pairs, new_pairs)) if o != n}
+                if 1 <= len(changed_idx) <= 8:
+                    self._fixture_changed_pairs[path[len("tests/fixtures/"):]] = changed_idx
             fmask = self.select_fixture(path)
             strip_spec = self._tpc_fixture_strip.get(path)
             if strip_spec is not None and old_pairs is not None and new_pairs is not None:
@@ -548,12 +580,32 @@ class Selector:
                 if _tpc_fixture_inputs(old_pairs) == _tpc_fixture_inputs(new_pairs):
                     fmask &= ~inputs_unchanged_strip
             return fmask, False, True, [], []
+        if path == "pyproject.toml":
+            file = SOURCE / path
+            if file.is_file():
+                old_toml_text = file.read_text(encoding="utf-8")
+                new_toml_text = apply(old_toml_text, fp.hunks)
+                try:
+                    old_toml = tomllib.loads(old_toml_text)
+                    new_toml = tomllib.loads(new_toml_text)
+                    old_tool = old_toml.get("tool") if isinstance(old_toml.get("tool"), dict) else {}
+                    new_tool = new_toml.get("tool") if isinstance(new_toml.get("tool"), dict) else {}
+                    pytest_same = old_tool.get("pytest") == new_tool.get("pytest") and "pytest" not in old_toml and "pytest" not in new_toml
+                except Exception:
+                    pytest_same = False
+                if pytest_same:
+                    readers = self._readers(path)
+                    if readers:
+                        patched_files[path] = new_toml_text
+                    return readers, readers == 0, readers == 0, [], []
         if path in PYTEST_CONFIG_FILES:
             raise Everything(f"pytest configuration {path}")
         if path.endswith(".py") and path.startswith(("sqlglot/", "tests/")):
             if path.startswith("tests/") and (path.endswith("__init__.py") or path.endswith("conftest.py")):
                 # Package plumbing: a real change reaches every test collected under its folder.
+                saved_spans_ok = self._spans_ok
                 py_mask, py_noop, new_text, _, _ = self.select_python_detailed(path, fp.hunks)
+                self._spans_ok = saved_spans_ok
                 if py_noop:
                     return 0, True, True, [], []
                 patched_files[path] = new_text
@@ -567,7 +619,10 @@ class Selector:
             # except when a sqlglot/typing/*.py change is a pure comment or AST-identical noop
             # (test_no_redundant_expression_metadata only inspects AST imports and EXPRESSION_METADATA).
             readers = impact.file_readers(path)
+            saved_spans_ok = self._spans_ok
             py_mask, py_noop, new_text, targets, attr_targets = self.select_python_detailed(path, fp.hunks)
+            if not path.startswith("sqlglot/"):
+                self._spans_ok = saved_spans_ok
             if py_noop and path.startswith("sqlglot/typing/"):
                 readers = 0
             if not py_noop or readers:
@@ -692,6 +747,10 @@ class Selector:
                 self._hot_spans_cur.update(hspans)
             else:
                 attr_targets = _extract_attr_hot_targets(path, module, old_scopes, new_scopes, hunks, self.impact)
+        else:
+            # Non-sqlglot .py edits (e.g. tests/*.py) are forced to Phase 1 in verify.py; keeping
+            # empty lists here preserves sqlglot/ hot_patch_targets for fast_a and tokenizer checks.
+            targets, attr_targets = [], []
         return mask, False, new_text, targets, attr_targets
 
     def select_block(

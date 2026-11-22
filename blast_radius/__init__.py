@@ -35,6 +35,7 @@ from pathlib import Path
 DATA = Path("/data")
 APP = Path(__file__).resolve().parent.parent
 SOURCE = APP / "sqlglot-src"
+SOURCE_C = APP / "sqlglot-c"
 MAP_FILE = APP / "map" / "impact.json.gz"
 
 

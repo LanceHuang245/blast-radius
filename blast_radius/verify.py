@@ -36,8 +36,9 @@ import types
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
-from blast_radius import SOURCE, log
+from blast_radius import SOURCE, SOURCE_C, log
 from blast_radius.impact_map import module_name
 from blast_radius.schedule import split_with_cost
 from blast_radius.select import Selection
@@ -76,6 +77,16 @@ MAX_PARALLEL_CHILDREN = int(os.environ.get("BR_PARALLEL", "2"))
 # estimates get BR_CPU_SCALE in __main__ (practice showed those too optimistic: c624afb spent
 # +35 s CPU for -22 s simulated).
 SPECIAL_CPU_SCALE = float(os.environ.get("BR_SPECIAL_CPU_SCALE", "1.0"))
+FAST_B_MAX_EST_MS = int(os.environ.get("BR_FAST_B_MAX_MS", "6500"))
+ENABLE_MYPYC = os.environ.get("BR_MYPYC", "1") != "0" and (SOURCE_C / "sqlglot").is_dir()
+
+# Tokenizer C leaves compiled via mypyc in /app/sqlglot-c for non-position-free test_max_nodes.
+LEAF_COMPILED_FILES = frozenset({
+    "sqlglot/tokenizer_core.py",
+    "sqlglot/trie.py",
+})
+
+PURE_PYTHON_ONLY_TESTS: frozenset[str] = frozenset()
 
 # Hard wall-clock limits, enforced by the parent (the run itself has 3 minutes, 4.5 in the final).
 CHILD_LIMIT_BASE_S = 8.0
@@ -139,6 +150,7 @@ class VerifyTask:
     tpc_query_mask: dict[int, int] = field(default_factory=dict)
     tpc_s2b_query_mask: dict[int, int] = field(default_factory=dict)
     cpu_override: dict[int, int] = field(default_factory=dict)
+    use_mypyc: bool = False
 
 
 class _LazyFuture(cf.Future):
@@ -230,12 +242,12 @@ class _OverlayLoader(importlib.abc.Loader):
 class _OverlayFinder(importlib.abc.MetaPathFinder):
     """Serves patched .py modules directly from memory before filesystem finders."""
 
-    def __init__(self, patched_files: dict[str, str | None]):
+    def __init__(self, patched_files: dict[str, str | None], root: Path = SOURCE):
         self._modules: dict[str, tuple[str, str | None, bool]] = {}
         for rel_path, text in patched_files.items():
             if rel_path.endswith(".py"):
                 mod = module_name(rel_path)
-                abs_path = str((SOURCE / rel_path).resolve())
+                abs_path = str((root / rel_path).resolve())
                 is_pkg = rel_path.endswith("/__init__.py") or rel_path == "__init__.py"
                 self._modules[mod] = (abs_path, text, is_pkg)
 
@@ -262,9 +274,12 @@ def _install_open_overlay(patched_files: dict[str, str | None]) -> None:
     if not patched_files:
         return
     overlay: dict[str, tuple[str, bytes] | None] = {}
+    roots = (SOURCE, SOURCE_C) if (SOURCE_C / "sqlglot").is_dir() else (SOURCE,)
     for rel_path, text in patched_files.items():
-        abs_path = os.path.abspath(str(SOURCE / rel_path))
-        overlay[abs_path] = None if text is None else (text, text.encode("utf-8"))
+        val = None if text is None else (text, text.encode("utf-8"))
+        for base in roots:
+            overlay[os.path.abspath(str(base / rel_path))] = val
+            overlay[os.path.realpath(str(base / rel_path))] = val
 
     orig_open = builtins.open
 
@@ -406,7 +421,7 @@ def _apply_code_hotpatch(
             return False
         mod_name = module_name(rel_path)
         mod = importlib.import_module(mod_name)
-        filename = str((SOURCE / rel_path).resolve())
+        filename = str((Path(os.getcwd()) / rel_path).resolve())
         lines: list[str] | None = None
         mod_code: types.CodeType | None = None
         for qualname in qualnames:
@@ -723,16 +738,23 @@ def _can_fast_max_nodes(sel: Selection) -> bool:
 
 def _can_fast_gen_mem(sel: Selection) -> tuple[bool, bool]:
     """Return (can_fast, is_scoped_only)."""
-    if "tests/test_generator.py" in sel.patched_files:
+    if any(
+        p in ("tests/test_generator.py", "tests/helpers.py", "tests/__init__.py", "tests/conftest.py")
+        for p in sel.patched_files
+    ):
         return False, False
     core_touched = any(
-        not p.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/"))
-        or p in (
-            "sqlglot/dialects/dialect.py",
-            "sqlglot/dialects/__init__.py",
-            "sqlglot/generators/__init__.py",
-            "sqlglot/parsers/base.py",
-            "sqlglot/typing/__init__.py",
+        p.startswith("sqlglot/")
+        and (
+            not p.startswith(("sqlglot/dialects/", "sqlglot/generators/", "sqlglot/parsers/", "sqlglot/typing/"))
+            or p
+            in (
+                "sqlglot/dialects/dialect.py",
+                "sqlglot/dialects/__init__.py",
+                "sqlglot/generators/__init__.py",
+                "sqlglot/parsers/base.py",
+                "sqlglot/typing/__init__.py",
+            )
         )
         for p in sel.patched_files
     )
@@ -787,6 +809,12 @@ def _special_cpu_ms(
     if tid == MAX_NODES_TEST_ID and _can_fast_max_nodes(sel):
         tok_touched = any(p in ("sqlglot/tokens.py", "sqlglot/tokenizer_core.py") for p in sel.patched_files)
         if tok_touched and not tokenizer_edit_position_free(sel):
+            if (
+                ENABLE_MYPYC
+                and "sqlglot/tokenizer_core.py" not in sel.patched_files
+                and not any(p in LEAF_COMPILED_FILES for p in sel.patched_files)
+            ):
+                return 2000
             return 16500
         return 400
     if tid == GEN_MEM_TEST_ID:
@@ -926,9 +954,10 @@ def _start_child_verification(
         _SKIP_POOL_PICKLE = not any(
             p in ("sqlglot/serde.py", "sqlglot/expressions/core.py") for p in task.selection.patched_files
         )
-        os.chdir(SOURCE)
-        if str(SOURCE) not in sys.path:
-            sys.path.insert(0, str(SOURCE))
+        root = SOURCE_C if task.use_mypyc else SOURCE
+        os.chdir(root)
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
         _patch_pool_references()
         _install_fail_fast_subtest()
 
@@ -937,7 +966,7 @@ def _start_child_verification(
             if "sqlglot" in sys.modules:
                 for k in [m for m in sys.modules if m == "sqlglot" or m.startswith(("sqlglot.", "tests."))]:
                     sys.modules.pop(k, None)
-            sys.meta_path.insert(0, _OverlayFinder(task.selection.patched_files))
+            sys.meta_path.insert(0, _OverlayFinder(task.selection.patched_files, root=root))
             _install_open_overlay(task.selection.patched_files)
             if (
                 "tests/dialects/test_dialect.py" not in task.selection.patched_files
@@ -1156,7 +1185,10 @@ def _start_child_verification(
                     _mark(num, True)
 
         verifiable = {
-            n for n in (task.chosen - passed) if id_by_number[n] not in SUBPROCESS_TESTS
+            n
+            for n in (task.chosen - passed)
+            if id_by_number[n] not in SUBPROCESS_TESTS
+            and not (task.use_mypyc and id_by_number[n] in PURE_PYTHON_ONLY_TESTS)
         }
         decap_set = set(task.decap_targets) & verifiable
 
@@ -1249,7 +1281,8 @@ def _start_child_verification(
 
         # Step 2c: the tail, as the best ROI prefix of what is still unverified, re-planned after
         # each failure with adaptive throttling and a deterministic estimated CPU cap.
-        if not (sel.fixture_only and not VERIFY_FIXTURE_MAX_MS):
+        fix_narrow_only = sel.fixture_only and not VERIFY_FIXTURE_MAX_MS
+        if not fix_narrow_only or (sel.fixture_changed_pairs and task.case_filter):
             per_mod_ms = 20 if task.phase == 1 else 4
             step2c_t0 = time.process_time()
             step2c_est_ms = 0
@@ -1261,9 +1294,12 @@ def _start_child_verification(
                 if s2c_failed >= 2 and not s2c_passed:
                     break
                 cur_roi = 2.5 if (s2c_failed >= 2 and s2c_failed >= s2c_passed) else MIN_ROI_RATIO
+                s2c_cands = verifiable - passed - failed - decap_set
+                if fix_narrow_only:
+                    s2c_cands = {n for n in s2c_cands if n in task.case_filter and len(task.case_filter[n]) <= 8}
                 batch = _best_drop_prefix(
                     task.chosen - passed,
-                    verifiable - passed - failed - decap_set,
+                    s2c_cands,
                     ms_by_number,
                     cpu_by_number,
                     MIN_GAIN_MS,
@@ -1294,6 +1330,8 @@ def _start_child_verification(
                     for n in (verifiable - passed)
                     if id_by_number[n] not in TPC_SUITE_BY_TEST_ID and id_by_number[n] != MAX_NODES_TEST_ID
                 }
+                if fix_narrow_only:
+                    rem_tail = {n for n in rem_tail if n in task.case_filter and len(task.case_filter[n]) <= 8}
                 cur_pool = task.chosen - passed
                 if rem_tail and cur_pool <= rem_tail:
                     rem_cpu = (
@@ -1338,6 +1376,7 @@ def _case_plan(
     sel: Selection,
     id_by_number: dict[int, str],
     base_cpu: dict[int, int],
+    number_by_index: list[int | None] | None = None,
 ) -> tuple[
     dict[int, set[tuple[str, int]]],
     dict[int, tuple[int, int]],
@@ -1357,12 +1396,24 @@ def _case_plan(
     tpc_s2b_query_mask: dict[int, int] = {}
     cpu_override: dict[int, int] = {}
 
+    non_sg_nums: set[int] = set()
+    if sel.non_sqlglot_mask and number_by_index is not None:
+        m = sel.non_sqlglot_mask
+        while m:
+            lsb = m & -m
+            n = number_by_index[lsb.bit_length() - 1]
+            if n is not None:
+                non_sg_nums.add(n)
+            m ^= lsb
+
     if sel.edited_spans is not None:
         if _CASE_MAP is None:
             from blast_radius.precompile_cases import CASES_FILE
 
             _CASE_MAP = marshal.loads(CASES_FILE.read_bytes()) if CASES_FILE.is_file() else {}
         for num in chosen:
+            if num in non_sg_nums:
+                continue
             tid = id_by_number[num]
             entry = _CASE_MAP.get(tid)
             if entry is None:
@@ -1433,6 +1484,31 @@ def _case_plan(
                     validator_filter[num] = (full_mask, entry.get("stride", 1))
                     cpu_override[num] = max(22, base_cpu[num] * (hits + 1) // (count + 1) + 10)
 
+    # Narrow fixture-only optimizer commits with <= 8 changed pairs to exact changed check_file cases.
+    if sel.fixture_only and sel.fixture_changed_pairs:
+        all_pairs_mapped = bool(sel.patched_files) and all(
+            p.startswith("tests/fixtures/") and p[len("tests/fixtures/") :] in sel.fixture_changed_pairs
+            for p in sel.patched_files
+        )
+        if all_pairs_mapped:
+            if _CASE_MAP is None:
+                from blast_radius.precompile_cases import CASES_FILE
+
+                _CASE_MAP = marshal.loads(CASES_FILE.read_bytes()) if CASES_FILE.is_file() else {}
+            for num in chosen:
+                entry = _CASE_MAP.get(id_by_number[num])
+                if entry is None or entry.get("kind") != "check_file":
+                    continue
+                cases = entry["cases"]
+                matched = {
+                    (fk, idx)
+                    for fk, idx in cases
+                    if fk in sel.fixture_changed_pairs and idx in sel.fixture_changed_pairs[fk]
+                }
+                if matched and len(matched) < len(cases):
+                    case_filter[num] = matched
+                    cpu_override[num] = max(25, base_cpu[num] * len(matched) // max(len(cases), 1) + 15)
+
     # Apply TPC-DS optimizer rule-stage checkpoint/suffix-span CPU estimate to TestOptimizer.test_tpcds.
     span_info = select_tpcds_span(sel.patched_files, max_start=14, for_exec=False, edited_spans=sel.edited_spans)
     if span_info is not None:
@@ -1460,6 +1536,15 @@ def plan_verification(
     for commit, chosen, sel in commits:
         if not chosen or not sel.patched_files or sel.reason.startswith("everything"):
             continue
+        touches_leaf = any(p in LEAF_COMPILED_FILES for p in sel.patched_files)
+        use_mypyc = (
+            ENABLE_MYPYC
+            and not touches_leaf
+            and "sqlglot/tokens.py" in sel.patched_files
+            and any(id_by_number[n] == MAX_NODES_TEST_ID for n in chosen)
+            and not tokenizer_edit_position_free(sel)
+        )
+        touches_test_py = any(p.startswith("tests/") and p.endswith(".py") for p in sel.patched_files)
         (
             case_filter,
             subtest_filter,
@@ -1468,10 +1553,15 @@ def plan_verification(
             tpc_query_mask,
             tpc_s2b_query_mask,
             cpu_override,
-        ) = _case_plan(chosen, sel, id_by_number, base_cpu)
+        ) = _case_plan(chosen, sel, id_by_number, base_cpu, number_by_index=number_by_index)
         cpu_by_number = {**base_cpu, **cpu_override} if cpu_override else base_cpu
         tids = [id_by_number[n] for n in chosen]
-        verifiable = {n for n in chosen if id_by_number[n] not in SUBPROCESS_TESTS}
+        verifiable = {
+            n
+            for n in chosen
+            if id_by_number[n] not in SUBPROCESS_TESTS
+            and not (use_mypyc and id_by_number[n] in PURE_PYTHON_ONLY_TESTS)
+        }
         if not verifiable:
             continue
 
@@ -1482,6 +1572,8 @@ def plan_verification(
             ENABLE_HOTPATCH
             and sel.hot_patch_targets is not None
             and not sel.lazy_pp_mask
+            and not touches_test_py
+            and not use_mypyc
             and not any(
                 tid in FRESH_IMPORT_TESTS and not (lazy_safe_p2 and tid == LAZY_LOAD_TEST_ID)
                 for tid in tids
@@ -1506,14 +1598,25 @@ def plan_verification(
         tpc_mode: str | None = None
         if tpc_nums and ENABLE_TPC_FAST:
             tpc_mode = select_tpc_mode(sel)
-            if tpc_mode is not None and not ENABLE_TPC_FAST_B and tpc_mode != "fast_a":
+            if tpc_mode == "full_cached" and not ENABLE_TPC_FAST_B:
                 tpc_mode = None
+            elif tpc_mode == "fast_b" and not ENABLE_TPC_FAST_B:
+                if any(
+                    _est_test_cpu_ms(
+                        n, id_by_number[n], sel, tpc_mode, cpu_by_number, tpc_query_mask, tpc_s2b_query_mask
+                    )
+                    > FAST_B_MAX_EST_MS
+                    for n in tpc_nums
+                ):
+                    tpc_mode = None
 
         rem_verifiable = verifiable - lazy_pp_nums
 
         # Identify high-ROI heavy and medium peak-shaving targets inside rem_verifiable.
         raw_decap: list[tuple[int, int, int]] = []  # (sim_ms, est_cpu_ms, num)
         for num in rem_verifiable:
+            if sel.fixture_only and not VERIFY_FIXTURE_MAX_MS and not (num in case_filter and len(case_filter[num]) <= 8):
+                continue
             tid = id_by_number[num]
             sim_ms = ms_by_number[num]
             if tid in TPC_SUITE_BY_TEST_ID:
@@ -1564,7 +1667,11 @@ def plan_verification(
 
         def plan_tail(pool: set[int], cands: set[int]) -> tuple[list[int], int]:
             if sel.fixture_only and not VERIFY_FIXTURE_MAX_MS:
-                return [], 0  # a fixture edit almost always breaks the tests reading it
+                if not (sel.fixture_changed_pairs and case_filter):
+                    return [], 0  # a fixture edit almost always breaks the tests reading it
+                cands = {n for n in cands if n in case_filter and len(case_filter[n]) <= 8}
+                if not cands:
+                    return [], 0
             prefix = _best_drop_prefix(
                 pool,
                 cands,
@@ -1625,6 +1732,7 @@ def plan_verification(
                 tpc_query_mask=tpc_query_mask,
                 tpc_s2b_query_mask=tpc_s2b_query_mask,
                 cpu_override=cpu_override,
+                use_mypyc=use_mypyc,
             )
         )
 

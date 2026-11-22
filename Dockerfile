@@ -13,6 +13,20 @@ RUN mkdir -p /app/sqlglot-src \
     && rm /tmp/sqlglot.tar.gz \
     && python -m compileall -q /app/sqlglot-src
 
+# Native C mypyc build of tokenizer_core and trie for fast test_max_nodes verification (kept separate from pure-Python sqlglot-src).
+RUN DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends gcc libc6-dev \
+    && mkdir -p /app/sqlglot-c \
+    && cp -r /app/sqlglot-src/sqlglot /app/sqlglot-c/sqlglot \
+    && ln -s /app/sqlglot-src/tests /app/sqlglot-c/tests \
+    && cd /app/sqlglot-c \
+    && MYPYPATH=/app/sqlglot-c python -c "import os, sys; from setuptools import setup; from mypyc.build import mypycify; src = '/app/sqlglot-c/sqlglot'; files = [os.path.join(src, f) for f in ('tokenizer_core.py', 'trie.py')]; sys.argv = ['setup.py', 'build_ext', '--inplace', '-j', str(os.cpu_count() or 2)]; setup(name='sqlglotc_leaf', ext_modules=mypycify(files, opt_level='2', debug_level='0', separate=True))" \
+    && rm -rf /app/sqlglot-c/build \
+    && PYTHONPATH=/app/sqlglot-c python -c "import sqlglot, sqlglot.tokenizer_core as tc, sqlglot.trie as tr; assert tc.__file__.endswith('.so') and tr.__file__.endswith('.so')" \
+    && chmod -R a+rX /app/sqlglot-c \
+    && apt-get purge -y --auto-remove -qq gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Precompile TPC baseline and impact.marshal before copying the rest of blast_radius so rebuilds stay cached.
 COPY blast_radius/__init__.py blast_radius/precompile_tpc.py /app/blast_radius/
 RUN mkdir -p /app/map \

@@ -52,9 +52,40 @@ TPC_SUITE_BY_TEST_ID = {
 TPC_DISALLOWED_FILES = frozenset({
     "tests/test_executor.py",
     "tests/helpers.py",
+    "tests/__init__.py",
+    "tests/conftest.py",
     "sqlglot/executor/__init__.py",
     "sqlglot/serde.py",
 })
+
+
+def _is_tpc_safe_non_sqlglot(path: str, for_exec: bool = True) -> bool:
+    """True if editing `path` (outside sqlglot/) cannot alter TestExecutor TPC-DS / TestOptimizer.test_tpcds."""
+    if path.startswith("tests/fixtures/"):
+        return not path.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/"))
+    if path.startswith("tests/"):
+        if path in TPC_DISALLOWED_FILES:
+            return False
+        if not for_exec and path == "tests/test_optimizer.py":
+            return False
+        return True
+    return not path.endswith(".py")
+
+
+def _all_tpc_safe(
+    patched_files: dict[str, str] | None,
+    for_exec: bool = True,
+    require_sqlglot: bool = True,
+) -> bool:
+    if not patched_files:
+        return False
+    has_sg = False
+    for p in patched_files:
+        if p.startswith("sqlglot/"):
+            has_sg = True
+        elif not _is_tpc_safe_non_sqlglot(p, for_exec=for_exec):
+            return False
+    return has_sg if require_sqlglot else True
 
 # Fallback Linux CPU estimates (ms); exact per-query timings are measured on the build host
 # in precompile_cases.py (s2b_query_ms) and used automatically when s2b_query_mask narrows queries.
@@ -100,7 +131,7 @@ def load_tpcds_ckpt_stage(stage: int) -> dict | None:
 
 def select_tpcds_ckpt(patched_files: dict[str, str], max_stage: int = 14) -> tuple[int, int] | None:
     """Return highest sound (rule_stage, est_ms) checkpoint for TPC-DS whose prefix files are untouched."""
-    if not patched_files or not all(p.startswith("sqlglot/") for p in patched_files):
+    if not _all_tpc_safe(patched_files, for_exec=False):
         return None
     meta = load_tpcds_ckpts_meta()
     if meta is None:
@@ -150,7 +181,7 @@ def select_tpcds_span(
       for_exec, or sql() gen_files for test_tpcds) are untouched (short-circuit RULES[stop_k:] when
       intermediate AST matches pinned ckpt[stop_k]).
     """
-    if not patched_files or not all(p.startswith("sqlglot/") for p in patched_files):
+    if not _all_tpc_safe(patched_files, for_exec=for_exec):
         return None
     meta = load_tpcds_ckpts_meta()
     if meta is None:
@@ -235,7 +266,7 @@ def est_tpc_fast_a_ms(
 ) -> int:
     """Estimate fast_a CPU (ms) accounting for untouched sub-stages, checkpoints, and per-query filtering."""
     base = TPC_EST_CPU_MS[(suite_name, "fast_a")]
-    if suite_name == "tpcds" and patched_files and all(p.startswith("sqlglot/") for p in patched_files):
+    if suite_name == "tpcds" and _all_tpc_safe(patched_files, for_exec=True):
         meta = load_tpcds_ckpts_meta()
         if meta is not None:
             bits = _touched_stage_bits(meta, patched_files, edited_spans)
@@ -418,18 +449,11 @@ def select_tpc_mode(sel: Selection) -> str | None:
         ):
             return None
 
-    sqlglot_or_non_tpc_fixture = all(
-        p.startswith("sqlglot/")
-        or (
-            p.startswith("tests/fixtures/")
-            and not p.startswith(("tests/fixtures/optimizer/tpc-ds/", "tests/fixtures/optimizer/tpc-h/"))
-        )
-        for p in sel.patched_files
-    )
+    tpc_safe_all = _all_tpc_safe(sel.patched_files, for_exec=True, require_sqlglot=False)
 
     # Function-body-only edits inside sqlglot/: if zero edited functions execute in Stage 2b,
     # Stage-1/2a bit-for-bit output parity proves Stage 2b receives identical inputs and code.
-    if sel.hot_patch_targets and not sel.attr_hot_targets and sqlglot_or_non_tpc_fixture:
+    if sel.hot_patch_targets and not sel.attr_hot_targets and tpc_safe_all:
         edited_pairs = {(rel_path, qual.rsplit(".", 1)[-1]) for rel_path, qual in sel.hot_patch_targets}
         touches_s1 = any(pair in meta["stage1_funcs"] for pair in edited_pairs)
         touches_s2b = any(pair in meta["stage2b_funcs"] for pair in edited_pairs)
@@ -444,7 +468,7 @@ def select_tpc_mode(sel: Selection) -> str | None:
     # Any edit (class attributes, module level, several files) outside every file that runs code
     # in Stage 2b leaves Stage 2b's code unchanged; fast_a checks its inputs (re-executing the
     # queries whose plans changed).
-    if sqlglot_or_non_tpc_fixture and all(p not in meta["stage2b_files"] for p in sel.patched_files):
+    if tpc_safe_all and all(p not in meta["stage2b_files"] for p in sel.patched_files):
         return "fast_a"
 
     return "full_cached"
@@ -567,7 +591,7 @@ def verify_tpc_test(
         start_layouts: list | None = None
         stop_dumps_b: list | None = None
         stop_dumps: list | None = None
-        if suite_name == "tpcds" and patched_files and all(p.startswith("sqlglot/") for p in patched_files):
+        if suite_name == "tpcds" and _all_tpc_safe(patched_files, for_exec=True):
             meta = load_tpcds_ckpts_meta()
             if meta is not None:
                 bits = _touched_stage_bits(meta, patched_files, edited_spans)
@@ -736,7 +760,7 @@ def verify_tpc_test(
         tpc_meta = load_tpc_meta()
         exec_keys = tpc_meta.get("exec_meta_keys") if tpc_meta else None
         exec_dump = None
-        if exec_keys and tpc_meta["exec_files"].isdisjoint(patched_files or {}):
+        if exec_keys and tpc_meta["exec_files"].isdisjoint({p for p in (patched_files or {}) if p.startswith("sqlglot/")}):
             exec_dump = exec_dump_fn(serde_dump, exec_keys)
         py_gen_sig = None
 
@@ -1012,7 +1036,7 @@ def verify_tpc_test(
 def verify_optimized_tpch(patched_files: dict[str, str]) -> bool:
     """Verify test_optimized_tpch via exact DuckDB transpile parity on all 22 query pairs (~0.09s CPU)."""
     if any(
-        p in ("tests/test_executor.py", "tests/helpers.py") or p.startswith("tests/fixtures/")
+        p in ("tests/test_executor.py", "tests/helpers.py") or p.startswith("tests/fixtures/optimizer/tpc-h/")
         for p in patched_files
     ):
         return False
