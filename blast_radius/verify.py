@@ -1062,6 +1062,8 @@ def _start_child_verification(
                 signal.alarm(0)
             return ok
 
+        tpcds_unchanged: set[int] = set()
+
         def _run_candidate(num: int) -> bool:
             tid = id_by_number[num]
             if tid == LAZY_LOAD_TEST_ID and "tests/dialects/test_dialect.py" not in sel.patched_files:
@@ -1070,15 +1072,17 @@ def _start_child_verification(
                 # edited code runs at import (or the built import state is proven unchanged).
                 return True if lazy_load_ok is None and task.phase == 2 else bool(lazy_load_ok)
             if task.tpc_mode and tid in TPC_SUITE_BY_TEST_ID:
+                suite = TPC_SUITE_BY_TEST_ID[tid]
                 signal.alarm(65)
                 try:
                     return verify_tpc_test(
-                        TPC_SUITE_BY_TEST_ID[tid],
+                        suite,
                         task.tpc_mode,
                         query_mask=task.tpc_query_mask.get(num),
                         s2b_query_mask=task.tpc_s2b_query_mask.get(num),
                         patched_files=sel.patched_files,
                         edited_spans=sel.edited_spans,
+                        unchanged_out=tpcds_unchanged if (suite == "tpcds" and task.tpc_mode == "fast_a") else None,
                     )
                 except BaseException:
                     return False
@@ -1093,7 +1097,12 @@ def _start_child_verification(
                 try:
                     cf_set = task.case_filter.get(num)
                     indices = {idx for _, idx in cf_set} if cf_set is not None else None
-                    return verify_opt_tpcds(sel.patched_files, indices, edited_spans=sel.edited_spans)
+                    return verify_opt_tpcds(
+                        sel.patched_files,
+                        indices,
+                        edited_spans=sel.edited_spans,
+                        skip_indices=tpcds_unchanged or None,
+                    )
                 except BaseException:
                     return False
                 finally:
@@ -1276,6 +1285,35 @@ def _start_child_verification(
                         break
                 if batch_ok:
                     break
+            # When the commit has 0 failures so far (>=2 passes) and verifying the remaining tail
+            # would empty the commit completely (dropping the 2.0s last-worker startup), accept a
+            # lower marginal ROI (>=1.15) with a tight 2.5s est CPU cap, stopping on first failure.
+            if not failed and len(passed) >= 2 and time.process_time() - step2c_t0 <= 12.0:
+                rem_tail = {
+                    n
+                    for n in (verifiable - passed)
+                    if id_by_number[n] not in TPC_SUITE_BY_TEST_ID and id_by_number[n] != MAX_NODES_TEST_ID
+                }
+                cur_pool = task.chosen - passed
+                if rem_tail and cur_pool <= rem_tail:
+                    rem_cpu = (
+                        sum(cpu_by_number[n] for n in rem_tail)
+                        + len({id_by_number[n].split("::", 1)[0] for n in rem_tail}) * per_mod_ms
+                    )
+                    cur_cost, _ = split_with_cost([(ms_by_number[n], n) for n in cur_pool])
+                    if (
+                        rem_cpu <= 2500
+                        and step2c_est_ms + rem_cpu <= 6500
+                        and cur_cost >= rem_cpu * 1.15
+                        and cur_cost - rem_cpu >= MIN_GAIN_MS
+                    ):
+                        tail_ordered = sorted(
+                            rem_tail,
+                            key=lambda n: (cpu_by_number[n], ms_by_number[n], id_by_number[n]),
+                        )
+                        for num in tail_ordered:
+                            if not _mark(num, _run_candidate(num)):
+                                break
     except BaseException:
         pass
     finally:

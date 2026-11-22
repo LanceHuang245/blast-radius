@@ -38,6 +38,7 @@ from blast_radius.precompile_tpc import (
     TPC_STAGE2_FILE,
     exec_dump_fn,
     plan_signature,
+    py_plan_signature,
 )
 from blast_radius.select import Selection
 
@@ -71,11 +72,11 @@ TPC_EST_CPU_MS = {
 # fast_a re-executes queries whose optimized plan changed; cheapest queries run first so broken
 # commits fail fast. Primary budget uses deterministic precompiled s2b_query_ms (identical across
 # all 3 scorer runs); TPC_REEXEC_BUDGET_S is an emergency hard CPU ceiling.
-TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "12"))
-TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "4000"))
-TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "5.0"))
-TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "12"))
-TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "3.0"))
+TPC_REEXEC_MAX_QUERIES = int(os.environ.get("BR_TPC_REEXEC_MAX", "35"))
+TPC_REEXEC_EST_BUDGET_MS = int(os.environ.get("BR_TPC_REEXEC_EST_MS", "4500"))
+TPC_REEXEC_BUDGET_S = float(os.environ.get("BR_TPC_REEXEC_BUDGET", "12.0"))
+TPC_DUCK_MAX_QUERIES = int(os.environ.get("BR_TPC_DUCK_MAX", "35"))
+TPC_DUCK_BUDGET_S = float(os.environ.get("BR_TPC_DUCK_BUDGET", "8.0"))
 
 _meta_cache: dict | None = None
 _ckpts_meta_cache: dict | None = None
@@ -304,6 +305,7 @@ def verify_opt_tpcds(
     patched_files: dict[str, str],
     case_indices: set[int] | None = None,
     edited_spans: tuple[tuple[str, int, int], ...] | None = None,
+    skip_indices: set[int] | None = None,
 ) -> bool:
     """Verify TestOptimizer.test_tpcds using untouched prefix checkpoint and/or suffix short-circuit."""
     span = select_tpcds_span(patched_files, max_start=14, for_exec=False, edited_spans=edited_spans)
@@ -335,8 +337,22 @@ def verify_opt_tpcds(
     stop_dumps = stop_data.get("dumps") if stop_data is not None else None
     ensured = ensure_schema(start_data["schema"]) if (start_k is None or start_k < 14) else None
     indices = sorted(case_indices) if case_indices is not None else range(len(expected))
+    # Queries already proven identical at stop_k <= 7 (before merge_subqueries/leave_tables_isolated)
+    # by fast_a need not be re-optimized when test_tpcds also stops at <= 7.
+    can_skip = (
+        skip_indices
+        if (
+            skip_indices
+            and stop_k is not None
+            and stop_k <= 7
+            and all("leave_tables_isolated" not in (src or "") for src in patched_files.values())
+        )
+        else None
+    )
 
     for index in indices:
+        if can_skip is not None and index in can_skip:
+            continue
         if start_k is None:
             expr = parse_one(sqls[index])
             if stop_k == 0:
@@ -503,6 +519,7 @@ def verify_tpc_test(
     s2b_query_mask: int | None = None,
     patched_files: dict[str, str] | None = None,
     edited_spans: tuple[tuple[str, int, int], ...] | None = None,
+    unchanged_out: set[int] | None = None,
 ) -> bool:
     """Verify test_execute_tpcds or test_execute_tpch in the forked child; True iff proven PASS."""
     from sqlglot import Dialect, find_tables, parse_one
@@ -721,9 +738,11 @@ def verify_tpc_test(
         exec_dump = None
         if exec_keys and tpc_meta["exec_files"].isdisjoint(patched_files or {}):
             exec_dump = exec_dump_fn(serde_dump, exec_keys)
+        py_gen_sig = None
 
         def _same_plan_or_rows(index: int, q: dict, opt_expr, live: bool) -> bool:
             """True if `opt_expr` plans like the pinned query, else if re-executing it gives the pinned rows."""
+            nonlocal py_gen_sig
             plan = Plan(opt_expr)
             if plan_signature(plan, serde_dump) == q["plan_sig"]:
                 return True
@@ -737,6 +756,16 @@ def verify_tpc_test(
             if exec_dump is not None and q.get("plan_sig_x") is not None:
                 if plan_signature(plan, exec_dump) == q["plan_sig_x"]:
                     return True
+            # Compiled-Python Plan signature: proves bit-for-bit identical PythonExecutor bytecode
+            # & tables/columns (ignores unused node.type, node.meta, and cosmetic AST diffs).
+            if q.get("plan_sig_py") is not None:
+                if py_gen_sig is None:
+                    py_gen_sig = Python().generator(identify=True, comments=False)
+                try:
+                    if py_plan_signature(plan, py_gen_sig) == q["plan_sig_py"]:
+                        return True
+                except Exception:
+                    pass
             return _check_changed_query(index, q["sql"], opt_expr, plan=plan)
 
         try:
@@ -790,6 +819,8 @@ def verify_tpc_test(
                             )
                             stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
                             if serde_dump(expr) == stop_raw:
+                                if unchanged_out is not None and stop_k <= 7:
+                                    unchanged_out.add(index)
                                 continue
                             opt_expr = optimize(
                                 expr,
@@ -827,12 +858,16 @@ def verify_tpc_test(
                             if stop_k == 0:
                                 stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
                                 if serde_dump(expr) == stop_raw:
+                                    if unchanged_out is not None:
+                                        unchanged_out.add(index)
                                     continue
                                 opt_expr = optimize(expr, ensured_schema, leave_tables_isolated=True)
                             else:
                                 mid = optimize(expr, ensured_schema, rules=RULES[:stop_k], leave_tables_isolated=True)
                                 stop_raw = pickle.loads(stop_dumps_b[index]) if stop_dumps_b is not None else stop_dumps[index]
                                 if serde_dump(mid) == stop_raw:
+                                    if unchanged_out is not None and stop_k <= 7:
+                                        unchanged_out.add(index)
                                     continue
                                 opt_expr = optimize(
                                     mid,

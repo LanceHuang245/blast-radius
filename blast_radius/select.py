@@ -220,28 +220,47 @@ def _narrow_added_dict_key(cls_key: str, attr: str, toks: tuple[str, ...], impac
     return impact.attr_usage(cls_key, attr) & exp_mask
 
 
-def _fixture_pairs(text: str) -> tuple[int, list[tuple[str, str, str]]]:
-    """Extract (segment_count, [(meta, input_sql, expected_sql)]) matching load_sql_fixture_pairs."""
-    filtered = "\n".join(line for line in text.splitlines() if not line.startswith("--"))
-    stmts = filtered.split(";")
-    out: list[tuple[str, str, str]] = []
-    for i in range(0, len(stmts) - 1, 2):
-        raw = stmts[i].strip()
-        meta_lines: list[str] = []
-        sql_lines: list[str] = []
-        for ln in raw.splitlines():
-            if ln.startswith("#"):
-                meta_lines.append(ln)
-            else:
-                sql_lines.append(ln)
-        out.append(("\n".join(meta_lines), "\n".join(sql_lines).strip(), stmts[i + 1].strip()))
-    return len(stmts), out
+_LINE_SQL_FIXTURES = frozenset(
+    {
+        "tests/fixtures/identity.sql",
+        "tests/fixtures/partial.sql",
+        "tests/fixtures/optimizer/qualify_columns__invalid.sql",
+    }
+)
 
 
-def _tpc_fixture_inputs(text: str) -> tuple[int, list[tuple[str, str]]]:
-    """Extract (segment_count, [(meta, input_sql)]) matching tests/helpers.py load_sql_fixture_pairs."""
-    n_seg, pairs = _fixture_pairs(text)
-    return n_seg, [(m, s) for m, s, _ in pairs]
+def _filter_sql_comments(text: str) -> str:
+    """Exact match to tests/helpers.py::_filter_comments."""
+    return "\n".join(line for line in text.splitlines() if line and not line.startswith("--"))
+
+
+def _fixture_pairs(text: str) -> list[tuple[dict[str, str], str, str]] | None:
+    """Parse sqlglot optimizer fixture exactly like tests/helpers.py::load_sql_fixture_pairs.
+
+    Returns None if malformed (e.g. a `#` header line missing `:`), so callers fall back
+    conservatively when TestExecutor.setUpClass() would raise.
+    """
+    try:
+        filtered = _filter_sql_comments(text)
+        stmts = filtered.split(";")
+        out: list[tuple[dict[str, str], str, str]] = []
+        for i in range(0, len(stmts) - 1, 2):
+            sql = stmts[i].strip()
+            sql_lines = sql.split("\n")
+            meta: dict[str, str] = {}
+            idx = 0
+            while sql_lines[idx].startswith("#"):
+                key, val = sql_lines[idx].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                idx += 1
+            out.append((meta, "\n".join(sql_lines[idx:]), stmts[i + 1].strip()))
+        return out
+    except Exception:
+        return None
+
+
+def _tpc_fixture_inputs(pairs: list[tuple[dict[str, str], str, str]]) -> list[tuple[dict[str, str], str]]:
+    return [(m, s) for m, s, _ in pairs]
 
 
 def _extract_hot_patch_targets(
@@ -323,20 +342,34 @@ class Selector:
             self.values = ValueMap(values_file, impact.test_ids)
         docs = [i for i, t in enumerate(impact.test_ids) if t.startswith("tests/test_docs.py")]
         self.docs_mask = sum(1 << i for i in docs)
-        self._tpc_exec_bit: dict[str, int] = {
-            # TestExecutor.setUpClass loads tpc-ds.sql, and every TestExecutor test ignores its
-            # expected optimized SQL (only TestOptimizer.test_tpcds checks it).
-            "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": impact.by_class.get(
-                "tests/test_executor.py::TestExecutor", 0
+        exec_cls_mask = impact.by_class.get("tests/test_executor.py::TestExecutor", 0)
+        tpcds_exec_bit = sum(
+            1 << i
+            for i, t in enumerate(impact.test_ids)
+            if t == "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+        )
+        tpch_exec_bit = sum(
+            1 << i
+            for i, t in enumerate(impact.test_ids)
+            if t == "tests/test_executor.py::TestExecutor::test_execute_tpch"
+        )
+        tpch_opt_bit = sum(
+            1 << i
+            for i, t in enumerate(impact.test_ids)
+            if t == "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+        )
+        # TestExecutor.setUpClass loads both tpc-ds.sql and tpc-h.sql, attributing both files to
+        # all 60 TestExecutor tests. When the patched fixture still parses cleanly in setUpClass,
+        # only the tests that actually read that suite's sqls can be affected.
+        self._tpc_fixture_strip: dict[str, tuple[int, int]] = {
+            # (always_strip_when_parseable, extra_strip_when_inputs_unchanged)
+            "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql": (
+                exec_cls_mask & ~tpcds_exec_bit,
+                tpcds_exec_bit,
             ),
-            # For tpc-h.sql, only TestExecutor.test_optimized_tpch reads expected optimized SQL.
-            "tests/fixtures/optimizer/tpc-h/tpc-h.sql": impact.by_class.get(
-                "tests/test_executor.py::TestExecutor", 0
-            )
-            & ~sum(
-                1 << i
-                for i, t in enumerate(impact.test_ids)
-                if t == "tests/test_executor.py::TestExecutor::test_optimized_tpch"
+            "tests/fixtures/optimizer/tpc-h/tpc-h.sql": (
+                exec_cls_mask & ~(tpch_exec_bit | tpch_opt_bit),
+                tpch_exec_bit,
             ),
         }
 
@@ -490,18 +523,30 @@ class Selector:
                 raise Everything(f"no pinned fixture for {path}")
             old_text = file.read_text(encoding="utf-8")
             new_text = apply(old_text, fp.hunks)
-            if path.startswith("tests/fixtures/optimizer/") and path.endswith(".sql"):
-                # load_sql_fixture_pairs strips `--` comment lines and trims around `;`:
+            old_pairs = new_pairs = None
+            if path in _LINE_SQL_FIXTURES:
+                # load_sql_fixtures strips `--` comments and blank lines.
+                if _filter_sql_comments(old_text) == _filter_sql_comments(new_text):
+                    return 0, True, True, [], []
+            elif (path.startswith("tests/fixtures/optimizer/") or path == "tests/fixtures/pretty.sql") and path.endswith(
+                ".sql"
+            ):
+                old_pairs = _fixture_pairs(old_text)
+                new_pairs = _fixture_pairs(new_text)
+                # load_sql_fixture_pairs strips `--` comments & blank lines and trims around `;`:
                 # pure comment/whitespace fixture edits cannot change any test.
-                if _fixture_pairs(old_text) == _fixture_pairs(new_text):
+                if old_pairs is not None and new_pairs is not None and old_pairs == new_pairs:
                     return 0, True, True, [], []
             patched_files[path] = new_text
             fmask = self.select_fixture(path)
-            # TestExecutor.test_execute_tpcds/tpch only read (meta, input_sql) and ignore the
-            # expected optimized output after `;`: strip them when inputs & metadata are unchanged.
-            exec_bit = self._tpc_exec_bit.get(path, 0)
-            if exec_bit and _tpc_fixture_inputs(old_text) == _tpc_fixture_inputs(new_text):
-                fmask &= ~exec_bit
+            strip_spec = self._tpc_fixture_strip.get(path)
+            if strip_spec is not None and old_pairs is not None and new_pairs is not None:
+                # setUpClass parses new_text cleanly: strip unrelated TestExecutor tests (e.g.
+                # editing tpc-h.sql can never break test_execute_tpcds!).
+                always_strip, inputs_unchanged_strip = strip_spec
+                fmask &= ~always_strip
+                if _tpc_fixture_inputs(old_pairs) == _tpc_fixture_inputs(new_pairs):
+                    fmask &= ~inputs_unchanged_strip
             return fmask, False, True, [], []
         if path in PYTEST_CONFIG_FILES:
             raise Everything(f"pytest configuration {path}")

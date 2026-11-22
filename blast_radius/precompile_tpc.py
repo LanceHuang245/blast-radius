@@ -160,6 +160,118 @@ def plan_signature(plan, dump_fn) -> tuple:
     return (root_digest, cte_sig, len(plan.dag))
 
 
+def py_plan_signature(plan, py_gen) -> bytes:
+    """Exact compiled-Python execution signature of a sqlglot Plan DAG.
+
+    Captures every step attribute, column name, dict order, dependency DAG, subquery plan,
+    and generated Python expression string that `PythonExecutor.execute(plan)` reads.
+    Two plans with equal `py_plan_signature` execute bit-for-bit identical Python bytecode
+    over identical tables and columns whenever Stage-2b runtime code is unchanged.
+    """
+    from sqlglot import exp
+    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.planner import Aggregate, Join, Plan, Scan, SetOperation, Sort
+
+    ex = PythonExecutor()
+    ex._ctes = plan.ctes
+
+    def _det_register_subquery(query):
+        if ex._ctes is not None and not query.args.get("with_"):
+            query.set("with_", ex._ctes)
+        sql = query.sql()
+        name = ex._plan_names_by_sql.get(sql)
+        if name is None:
+            h = hashlib.blake2b(sql.encode("utf-8"), digest_size=8).hexdigest()
+            name = ex._plan_names_by_sql[sql] = f"_sq_{h}"
+            ex._subquery_plans[name] = (Plan(query), {})
+        return exp.Literal.string(name)
+
+    ex._register_subquery = _det_register_subquery
+
+    def gen(e) -> str | None:
+        if not e:
+            return None
+        return py_gen.generate(ex._replace_subqueries(e))
+
+    def gen_list(es) -> tuple:
+        return tuple(gen(e) for e in es) if es else ()
+
+    def col_names(es) -> tuple:
+        return tuple(e.alias_or_name if isinstance(e, exp.Expr) else e for e in es) if es else ()
+
+    visited: dict[int, bytes] = {}
+
+    def encode_step(step) -> bytes:
+        sid = id(step)
+        if sid in visited:
+            return visited[sid]
+        # Sort by (name, content_digest) so sibling steps sharing (name, type) are order-independent
+        # across PYTHONHASHSEEDs (content-hashed subquery names keep encode_step order-invariant).
+        deps = tuple(sorted((d.name or "", encode_step(d)) for d in step.dependencies))
+        common = (
+            type(step).__name__,
+            step.name,
+            bool(step.projections),
+            gen_list(step.projections),
+            col_names(step.projections),
+            gen(step.condition),
+            step.limit,
+            step.offset,
+            deps,
+        )
+        if isinstance(step, Scan):
+            src = step.source
+            if isinstance(src, exp.Table):
+                body: tuple = ("table", src.catalog, src.db, src.name, src.alias, src.alias_or_name)
+            elif isinstance(src, exp.Expr):
+                body = ("expr", src.name, src.alias, src.alias_or_name)
+            else:
+                body = ("raw", src)
+        elif isinstance(step, Aggregate):
+            body = (
+                step.source,
+                tuple((k, gen(v)) for k, v in step.group.items()),
+                gen_list(step.aggregations),
+                col_names(step.aggregations),
+                gen_list(step.operands),
+                col_names(step.operands),
+            )
+        elif isinstance(step, Join):
+            body = (
+                step.source_name,
+                tuple(
+                    (
+                        jname,
+                        gen_list(jspec.get("source_key")),
+                        gen_list(jspec.get("join_key")),
+                        jspec.get("side"),
+                        jspec.get("join_key_is_unique"),
+                        gen(jspec.get("condition")),
+                    )
+                    for jname, jspec in step.joins.items()
+                ),
+            )
+        elif isinstance(step, Sort):
+            body = (gen_list(step.key),)
+        elif isinstance(step, SetOperation):
+            body = (step.op.__name__, step.left, step.right, step.distinct)
+        else:
+            body = (repr(step),)
+        digest = hashlib.blake2b(pickle.dumps((common, body), protocol=4), digest_size=16).digest()
+        visited[sid] = digest
+        return digest
+
+    main = encode_step(plan.root)
+    # Also hash every subquery plan registered while compiling expressions (including nested ones).
+    sq_done: dict[str, bytes] = {}
+    while len(sq_done) < len(ex._subquery_plans):
+        for sq_name, (sq_plan, _) in list(ex._subquery_plans.items()):
+            if sq_name not in sq_done:
+                sq_done[sq_name] = encode_step(sq_plan.root)
+    payload = (main, len(plan.dag), tuple(sorted(sq_done.items())))
+    return hashlib.blake2b(pickle.dumps(payload, protocol=4), digest_size=16).digest()
+
+
 def _record_suite(
     suite_name: str,
     schema: dict,
@@ -171,12 +283,14 @@ def _record_suite(
     exec_dump=None,
 ) -> tuple[dict, dict]:
     from sqlglot import find_tables, parse_one, transpile
-    from sqlglot.executor.python import PythonExecutor
+    from sqlglot.executor.python import Python, PythonExecutor
     from sqlglot.executor.table import Table, ensure_tables
     from sqlglot.optimizer import optimize
     from sqlglot.planner import Plan
     from sqlglot.schema import ensure_schema
     from sqlglot.serde import dump as serde_dump
+
+    py_gen_sig = Python().generator(identify=True, comments=False)
 
     src_prefix = str(SOURCE.resolve()) + "/"
     phase = [""]  # "s1", "s2a", "s2b"
@@ -253,11 +367,10 @@ def _record_suite(
             phase[0] = ""
             opt_dump = serde_dump(opt_expr)
             p_sig = plan_signature(plan, serde_dump)
-            p_sig_x = None
-            if exec_dump is not None:
-                sys.setprofile(None)  # pure Python dumping: profiling it would only slow the build
-                p_sig_x = plan_signature(plan, exec_dump)
-                sys.setprofile(profiler)
+            sys.setprofile(None)  # pure Python dumping: profiling it would only slow the build
+            p_sig_x = plan_signature(plan, exec_dump) if exec_dump is not None else None
+            p_sig_py = py_plan_signature(plan, py_gen_sig)
+            sys.setprofile(profiler)
 
             # Stage 2b covers ensure_tables, PythonExecutor init, and row execution.
             phase[0] = "s2b"
@@ -275,6 +388,7 @@ def _record_suite(
                 "opt_dump": opt_dump,
                 "plan_sig": p_sig,
                 "plan_sig_x": p_sig_x,
+                "plan_sig_py": p_sig_py,
             })
             queries_s2.append({
                 "execute": True,
